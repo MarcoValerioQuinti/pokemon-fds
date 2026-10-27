@@ -1,6 +1,7 @@
 # Competition data: download from Kaggle (see data/README.md). train.jsonl exceeds GitHub's 100 MB limit.
 data/*
 !data/README.md
+submission1.ipynb
 
 # Generated: feature caches, simulations, OOF predictions, experiments, submissions
 outputs/

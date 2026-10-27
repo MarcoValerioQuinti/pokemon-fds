@@ -25,8 +25,8 @@ from compute import configure, describe, n_jobs
 from features import load_jsonl
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-DATA = os.path.join(ROOT, "data")
-OUT = os.path.join(ROOT, "outputs")
+DATA = os.environ.get("POKEMON_DATA", os.path.join(ROOT, "data"))  # su Kaggle: /kaggle/input/...
+OUT = os.environ.get("POKEMON_OUT", os.path.join(ROOT, "outputs"))
 EMA = 0.8
 MAX_TURNS = 200
 SNAP_TURNS = (24, 26, 28)
@@ -208,6 +208,7 @@ def main():
     print(f"rollout completati ({time.time() - t0:.0f}s)")
     print(f"accuracy di rec_win > 0.5 sul train: {((df.rec_win.values[trm] > 0.5) == y).mean():.4f}")
     print(df[trm].describe().T[["mean", "std"]])
+    os.makedirs(OUT, exist_ok=True)
     df.to_pickle(os.path.join(OUT, args.out))
 
 

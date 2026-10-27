@@ -98,6 +98,10 @@ reports/
   01_report_statistico_dati.ipynb     data statistics and significance
   02_report_costi_benefici.ipynb      cost/benefit of every method and model
   build_notebooks.py                  generates both notebooks
+kaggle/
+  pokemon-fds-final.ipynb             self-contained Kaggle notebook: trains the final model, writes submission.csv
+  build_kaggle_notebook.py            builds the notebook from src/ and kernel-metadata.json
+  README.md                           how to submit from the Kaggle website or the Kaggle CLI
 outputs/                   caches, OOF predictions, experiments, submissions (generated)
 ```
 
@@ -117,11 +121,17 @@ pip install -r requirements.txt
 # macOS only: LightGBM needs OpenMP
 conda install -c conda-forge llvm-openmp
 
-python src/train.py           # base features + snapshots (cached in outputs/), ~30 s
-python src/simulate.py        # Monte Carlo features, ~3 min
+python src/simulate.py        # Monte Carlo features (100 simulations per battle), ~3 min
 python src/recursive.py       # recursive roll-out features, ~2 min
-python src/final_model.py     # 10 base models + meta-learner -> outputs/submission_final.csv, ~6 min
+python src/final_model.py     # features + 10 base models + meta-learner -> outputs/submission_final.csv, ~7 min
 ```
+
+The data and output folders default to `data/` and `outputs/`. The `POKEMON_DATA` and `POKEMON_OUT`
+environment variables override them; the Kaggle notebook sets both.
+
+**Submitting on Kaggle.** [`kaggle/`](kaggle/README.md) contains a self-contained notebook that runs
+this same pipeline on the competition data and writes `submission.csv`, plus a step-by-step guide
+for the website and the Kaggle CLI.
 
 Other entry points:
 

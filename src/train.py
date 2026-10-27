@@ -22,8 +22,8 @@ from compute import catboost_params, configure, describe, xgb_params
 from features import build_context, build_frame, build_pokedex, clean_battles, load_jsonl, load_type_chart
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-DATA = os.path.join(ROOT, "data")
-OUT = os.path.join(ROOT, "outputs")
+DATA = os.environ.get("POKEMON_DATA", os.path.join(ROOT, "data"))  # su Kaggle: /kaggle/input/...
+OUT = os.environ.get("POKEMON_OUT", os.path.join(ROOT, "outputs"))
 SEED = 42
 N_FOLDS = 5
 

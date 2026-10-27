@@ -22,8 +22,8 @@ from features import (HEAL_MOVES, FIXED_DAMAGE, build_cooccurrence, build_pokede
                       damage_frac, infer_hp_types, load_jsonl, load_type_chart, stab_moves)
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-DATA = os.path.join(ROOT, "data")
-OUT = os.path.join(ROOT, "outputs")
+DATA = os.environ.get("POKEMON_DATA", os.path.join(ROOT, "data"))  # su Kaggle: /kaggle/input/...
+OUT = os.environ.get("POKEMON_OUT", os.path.join(ROOT, "outputs"))
 MAX_TURNS = 250
 SNAP_TURNS = (24, 26, 28)
 CRIT = 0.066
@@ -304,7 +304,7 @@ def simulate_battle(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n-sims", type=int, default=40)
+    ap.add_argument("--n-sims", type=int, default=100)  # valore usato per le feature dello stack finale
     ap.add_argument("--limit", type=int, default=0, help="solo le prime N battaglie di train (debug)")
     ap.add_argument("--clean", action="store_true", help="usa le timeline pulite dalle mosse persistenti")
     ap.add_argument("--n-jobs", type=int, default=0, help="processi paralleli (default: tutti i core)")
@@ -333,6 +333,7 @@ def main():
     print(f"accuracy di mc_win > 0.5 sul train: {((df.mc_win.values[trm] > 0.5) == y[trm]).mean():.4f}")
     print(df[trm].describe().T[["mean", "std"]])
     if not args.limit:
+        os.makedirs(OUT, exist_ok=True)
         df.to_pickle(os.path.join(OUT, "mc_features.pkl"))
 
 

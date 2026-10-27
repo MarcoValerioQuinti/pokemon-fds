@@ -76,11 +76,13 @@ def main():
     Z, Zte = logits(stacking.OOF_DIR, FINAL_MODELS), logits(stacking.OOF_DIR, FINAL_MODELS, "test")
     acc, sd, pm = meta_oof(Z, y)
     print(f"\nstack finale ({len(FINAL_MODELS)} modelli, extra={extra or 'nessuna'}): meta logreg {acc:.4f} ± {sd:.4f}")
-    ref_names = sorted(f[:-4] for f in os.listdir(REFERENCE) if f.endswith(".npz"))
-    ref_acc, ref_sd, pr = meta_oof(logits(REFERENCE, ref_names), y)
-    d, lo, hi, p = paired((pr > 0.5) == y, (pm > 0.5) == y)
-    print(f"riferimento ({len(ref_names)} modelli, mc,rec): {ref_acc:.4f} ± {ref_sd:.4f}")
-    print(f"differenza finale - riferimento: {d * 100:+.2f} punti, IC95% [{lo * 100:+.2f}, {hi * 100:+.2f}], McNemar p = {p:.3f}")
+    # confronto con lo stack a 22 solo se le sue OOF sono in cache (non su un ambiente nuovo, es. Kaggle)
+    ref_names = sorted(f[:-4] for f in os.listdir(REFERENCE) if f.endswith(".npz")) if os.path.isdir(REFERENCE) else []
+    if set(ref_names) > set(FINAL_MODELS):
+        ref_acc, ref_sd, pr = meta_oof(logits(REFERENCE, ref_names), y)
+        d, lo, hi, p = paired((pr > 0.5) == y, (pm > 0.5) == y)
+        print(f"riferimento ({len(ref_names)} modelli, mc,rec): {ref_acc:.4f} ± {ref_sd:.4f}")
+        print(f"differenza finale - riferimento: {d * 100:+.2f} punti, IC95% [{lo * 100:+.2f}, {hi * 100:+.2f}], McNemar p = {p:.3f}")
 
     meta = LogisticRegression(C=1.0, max_iter=2000).fit(Z, y)
     print("pesi del meta:", dict(zip(FINAL_MODELS, np.round(meta.coef_[0], 3))))

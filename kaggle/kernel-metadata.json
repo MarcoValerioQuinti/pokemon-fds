@@ -1,0 +1,17 @@
+{
+  "id": "YOUR_KAGGLE_USERNAME/pokemon-fds-final",
+  "title": "Pokemon FDS Final",
+  "code_file": "pokemon-fds-final.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": [
+    "fds-pokemon-battles-prediction-2026"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}
