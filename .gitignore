@@ -1,0 +1,18 @@
+# Competition data: download from Kaggle (see data/README.md). train.jsonl exceeds GitHub's 100 MB limit.
+data/*
+!data/README.md
+
+# Generated: feature caches, simulations, OOF predictions, experiments, submissions
+outputs/
+catboost_info/
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
