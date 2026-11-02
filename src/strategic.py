@@ -1,17 +1,16 @@
-"""Feature strategiche di matchup sull'intera squadra (Fase 3) e probabilistiche (Fase 4).
+"""Team-wide strategic matchup features (Phase 3) and probabilistic features (Phase 4).
 
-Per ogni coppia attaccante-difensore tra i pokemon vivi dei due lati si stima, con il motore
-di danno di features.py (verificato contro Showdown in tests/test_damage.py):
-  - danno atteso della mossa migliore (mosse rivelate, poi le più usate dalla specie, poi STAB);
-  - distribuzione del danno: 39 roll (217..255)/255, critico 17/256 (x2), precisione;
-  - P(KO in 1 colpo), P(KO entro 2 colpi), colpi per il KO, chi è più veloce;
-  - esito del duello 1 contro 1 (chi manda KO l'altro per primo).
-La matrice viene aggregata in feature interpretabili (prefisso strat_) e in feature
-probabilistiche dello scambio tra gli attivi (prefisso prob_), tenute separate per gli A/B.
-I pokemon non visti di p2 sono completati con K scenari campionati dalle co-occorrenze
-(senza etichette): per i punteggi di squadra si riportano media e deviazione standard.
+For each living attacker-defender pair on opposing sides, use the features.py damage
+engine (compared with Showdown in tests/test_damage.py) to estimate:
+  - best expected move damage (revealed moves, common species moves, then STAB);
+  - damage distribution: 39 rolls (217..255)/255, critical probability 17/256 (x2), accuracy;
+  - one-hit and two-hit KO probabilities, hits to KO and speed order;
+  - the one-on-one duel outcome (which Pokemon scores a KO first).
+Aggregate matrices into interpretable strat_ features and probabilistic active-exchange
+prob_ features, kept separate for A/B comparisons. Complete unseen p2 Pokemon using
+K label-free co-occurrence scenarios; report team-score means and standard deviations.
 
-Uso: python src/strategic.py  ->  outputs/strat_features.pkl (turno 30 + snapshot 24/26/28 di train)
+Usage: python src/strategic.py -> outputs/strat_features.pkl (turn 30 and train snapshots 24/26/28)
 """
 import argparse
 import os
@@ -33,21 +32,21 @@ from train import DATA, OUT
 
 SNAP_TURNS = (24, 26, 28)
 K_SCENARIOS = 8
-POOL_LAMBDA = 0.85  # peso del pool contro le co-occorrenze (scelto nel test di ricostruzione, senza etichette)
+POOL_LAMBDA = 0.85  # Pool weight versus co-occurrence, chosen by label-free reconstruction evaluation
 ROLLS = np.arange(217, 256) / 255
 P_CRIT = 17 / 256
 _W = {}
 
 
 def hit_dist(raw, acc):
-    """Distribuzione discreta del danno di un colpo (frazione degli HP max): valori e probabilità."""
+    """Discrete single-hit damage distribution, as fractions of maximum HP: values and probabilities."""
     vals = np.concatenate([[0.0], raw * ROLLS, 2 * raw * ROLLS])
     p = np.concatenate([[1 - acc], np.full(39, acc * (1 - P_CRIT) / 39), np.full(39, acc * P_CRIT / 39)])
     return vals, p
 
 
 def p_ko(raw, acc, hp, hits):
-    """P(danno cumulato >= hp) entro `hits` colpi (1 o 2)."""
+    """P(cumulative damage >= hp) within `hits` attacks (one or two)."""
     if raw <= 0 or hp <= 0:
         return float(hp <= 0)
     v, p = hit_dist(raw, acc)
@@ -58,7 +57,7 @@ def p_ko(raw, acc, hp, hits):
 
 
 class State:
-    """Stato al termine della timeline: hp, status, mosse note, livelli e item di p1."""
+    """Final timeline state: HP, status, known moves, levels and p1 items."""
 
     def __init__(self, b):
         self.p1_items = {p["name"]: p["item"] for p in b["p1_team_details"]}
@@ -78,13 +77,13 @@ class State:
         self.active = {s: last[s + "_pokemon_state"]["name"] for s in ("p1", "p2")}
         self.boosts = {s: last[s + "_pokemon_state"]["boosts"] for s in ("p1", "p2")}
         self.sub = {s: "substitute" in last[s + "_pokemon_state"]["effects"] for s in ("p1", "p2")}
-        self.virtual = {}  # mosse dei pokemon p2 non visti nello scenario corrente
+        self.virtual = {}  # Moves of unseen p2 Pokemon in the current scenario
 
 
 def best_hit(st, side, att, dfn, cache):
-    """(danno grezzo frazionale senza roll né precisione, precisione, speciale?) della mossa
-    con il miglior danno atteso di att su dfn. Le mosse vengono da st.known, oppure da
-    st.virtual (pokemon non visti di uno scenario, mosse del team del pool)."""
+    """Return (raw fractional damage without roll/accuracy, accuracy, is_special)
+    for att's best expected move against dfn. Moves come from st.known or
+    st.virtual (unseen scenario Pokemon with moves from a pool team)."""
     moves = st.known[side].get(att) or st.virtual.get(att) or {}
     key = (side, att, dfn, tuple(moves))
     if key in cache:
@@ -118,7 +117,7 @@ def speed(st, side, n, active_boost=True):
 
 
 def pair_matrix(st, A, D, side, other, hp, cache):
-    """Matrici sui vivi: danno atteso, colpi per il KO, P(KO1), P(KO2), più veloce."""
+    """Living-Pokemon matrices: expected damage, hits to KO, P(KO1), P(KO2), speed advantage."""
     n, m = len(A), len(D)
     exp_dmg, htk, ko1, ko2, faster = (np.zeros((n, m)) for _ in range(5))
     for i, a in enumerate(A):
@@ -134,25 +133,25 @@ def pair_matrix(st, A, D, side, other, hp, cache):
 
 
 def team_scores(st, A1, A2, hp, cache):
-    """Punteggi di squadra dal punto di vista di p1 contro p2 (e viceversa)."""
+    """Team scores from p1 against p2 and vice versa."""
     _, htk12, ko1_12, ko2_12, fast12 = pair_matrix(st, A1, A2, "p1", "p2", hp, cache)
     _, htk21, ko1_21, ko2_21, _ = pair_matrix(st, A2, A1, "p2", "p1", hp, cache)
-    # duello a vs d: a vince se manda KO in meno colpi, o negli stessi colpi essendo più veloce
+    # Attacker wins with fewer hits to KO, or equal hits and higher speed.
     t_a, t_d = htk12, htk21.T
     win1 = (t_a < t_d) | ((t_a == t_d) & (fast12 > 0))
-    margin = np.log(t_d) - np.log(t_a)  # >0: favorevole a p1
+    margin = np.log(t_d) - np.log(t_a)  # Positive values favor p1.
     f = {}
-    f["p1_answered_frac"] = win1.any(axis=0).mean()   # avversari con almeno un counter in p1
-    f["p2_answered_frac"] = (~win1).any(axis=1).mean()  # pokemon p1 con almeno un counter in p2
-    f["p1_unanswered_threats"] = (~(~win1).any(axis=1)).sum()  # p1 che nessuno di p2 batte
+    f["p1_answered_frac"] = win1.any(axis=0).mean()   # Opponents with at least one p1 counter
+    f["p2_answered_frac"] = (~win1).any(axis=1).mean()  # p1 Pokemon with at least one p2 counter
+    f["p1_unanswered_threats"] = (~(~win1).any(axis=1)).sum()  # p1 Pokemon that no p2 Pokemon beats
     f["p2_unanswered_threats"] = (~win1.any(axis=0)).sum()
     f["fav_pair_frac"] = win1.mean()
-    score1 = margin.mean(axis=1)  # punteggio medio di ogni pokemon p1 contro i vivi di p2
+    score1 = margin.mean(axis=1)  # Mean score of each p1 Pokemon against living p2 opponents
     score2 = -margin.mean(axis=0)
     for side, sc in (("p1", score1), ("p2", score2)):
         f[f"{side}_mon_score_min"], f[f"{side}_mon_score_med"], f[f"{side}_mon_score_max"] = (
             sc.min(), np.median(sc), sc.max())
-    # assegnazione ottima dei duelli (proxy strategica, non l'ordine reale)
+    # Optimal duel assignment: a strategic proxy, not the actual battle order
     r, c = linear_sum_assignment(-margin)
     f["matching_margin"] = margin[r, c].sum() / max(len(A1), len(A2))
     f["p1_ohko_frac"] = (ko1_12.max(axis=0) > 0.5).mean()
@@ -163,7 +162,7 @@ def team_scores(st, A1, A2, hp, cache):
 
 
 def active_features(st, A1, A2, hp, cache):
-    """Scambio tra gli attivi e switch sicuri (con boost dell'attivo e substitute)."""
+    """Active exchange and safe switches, including active boosts and substitute."""
     f = {}
     a1, a2 = st.active["p1"], st.active["p2"]
     if a1 not in A1 or a2 not in A2:
@@ -181,7 +180,7 @@ def active_features(st, A1, A2, hp, cache):
         f[f"prob_{side}_dmg_p90"] = v[np.searchsorted(np.cumsum(p), 0.9)]
     sp1, sp2 = speed(st, "p1", a1), speed(st, "p2", a2)
     p1_first = 1.0 if sp1 > sp2 else 0.0 if sp1 < sp2 else 0.5
-    # P(p1 manda KO l'attivo di p2 prima di subire il KO), con un orizzonte di due turni
+    # P(p1 KOs the p2 active before being KOed), within a two-turn horizon
     k1, k2 = f["prob_p1_ko1"], f["prob_p2_ko1"]
     f["prob_p1_survives_response"] = 1 - k2
     f["prob_p2_survives_response"] = 1 - k1
@@ -190,7 +189,7 @@ def active_features(st, A1, A2, hp, cache):
     f["prob_p2_wins_exchange"] = (1 - p1_first) * (k2 + (1 - k2) * (1 - k1) * f["prob_p2_ko2"]) + \
         p1_first * (1 - k1) * (k2 + (1 - k2) * (1 - f["prob_p1_ko2"]) * f["prob_p2_ko2"])
     f["prob_exchange_diff"] = f["prob_p1_wins_exchange"] - f["prob_p2_wins_exchange"]
-    # switch sicuri contro l'attivo avversario: chi entra non va KO entro due colpi con P>0.5
+    # Safe switches: entrants survive two hits with probability >0.5.
     for side, other, A, d in (("p1", "p2", A1, a2), ("p2", "p1", A2, a1)):
         bench = [a for a in A if a != st.active[side]]
         safe = []
@@ -198,7 +197,7 @@ def active_features(st, A1, A2, hp, cache):
             raw, acc, _ = best_hit(st, other, d, a, cache)
             safe.append(p_ko(raw, acc, hp[side][a], 2) < 0.5)
         f[f"strat_{side}_safe_switches"] = float(sum(safe))
-        # migliore risposta disponibile all'attivo avversario (margine del duello)
+        # Best available response to the opposing active Pokemon, measured by duel margin
         best = -9.0
         for a in A:
             r1, c1, _ = best_hit(st, side, a, d, cache)
@@ -222,7 +221,7 @@ def battle_row(b):
         f.update(active_features(st, A1, A2, hp, cache))
         seen = {k: v for k, v in team_scores(st, A1, A2, hp, cache).items()}
         f.update({f"strat_seen_{k}": v for k, v in seen.items()})
-        # scenari per i non visti di p2: co-occorrenze (strat_full_) e pool di team (strat_pool_)
+        # Unseen-p2 scenarios: co-occurrence (strat_full_) and team pool (strat_pool_)
         n_unseen = max(6 - len(st.hp["p2"]), 0)
         seen2 = sorted(st.hp["p2"])
         probs = {}
@@ -287,9 +286,9 @@ def battle_row(b):
 
 
 def build_team_moves(battles):
-    """Mosse rivelate da ogni specie, separate per team completo: (team, specie) -> mosse.
-    È la parte "moveset" della distribuzione congiunta: lo stesso team del pool tende a
-    riusare gli stessi set."""
+    """Revealed species moves grouped by complete team: (team, species) -> moves.
+    This is the moveset part of the joint distribution: recurring pool teams
+    tend to reuse the same sets."""
     out = defaultdict(lambda: defaultdict(dict))
     for b in battles:
         teams = {"p1": frozenset(p["name"] for p in b["p1_team_details"])}
@@ -323,7 +322,7 @@ def main():
     chart = load_type_chart(os.path.join(DATA, "type_chart_gen2.csv"))
     full = load_jsonl(os.path.join(DATA, "train.jsonl")) + load_jsonl(os.path.join(DATA, "test.jsonl"))
     dex = build_pokedex(full)
-    ctx = build_context(full, dex, chart)  # stesso contesto (senza etichette) delle feature base
+    ctx = build_context(full, dex, chart)  # Same label-free context as the base features
     ctx["pool"] = TeamPool(full)
     ctx["team_moves"] = build_team_moves(full)
     snaps = [{**b, "battle_timeline": b["battle_timeline"][:t]} for t in SNAP_TURNS for b in train]

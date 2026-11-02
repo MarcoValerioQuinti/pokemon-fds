@@ -1,10 +1,10 @@
-"""Test del motore di danno (features.damage_frac) contro la formula Gen 2 di Pokémon Showdown.
+"""Compare features.damage_frac with the Pokemon Showdown Gen 2 damage formula.
 
-Riferimento: smogon/pokemon-showdown, data/mods/gen2/scripts.ts (getDamage/getStat). La formula
-esatta con arrotondamenti interi è reimplementata qui (`showdown_damage`); damage_frac usa la
-versione continua con roll medio, quindi i confronti hanno una tolleranza.
+Reference: smogon/pokemon-showdown, data/mods/gen2/scripts.ts (getDamage/getStat).
+showdown_damage reimplements the exact integer formula; damage_frac uses a continuous
+approximation with a mean roll, so comparisons allow a tolerance.
 
-Esegui: conda run -n pokemon-fds python -m pytest tests -q
+Run: conda run -n pokemon-fds python -m pytest tests -q
 """
 import os
 import sys
@@ -17,8 +17,11 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from features import (SPECIAL_TYPES, boost_mult, calc_stat, damage_frac, load_type_chart,  # noqa: E402
                       type_mult)
 
-CHART = load_type_chart(os.path.join(ROOT, "data", "type_chart_gen2.csv"))
-DEX = {  # base stats e tipi come nel dataset
+CHART_PATH = os.path.join(ROOT, "data", "type_chart_gen2.csv")
+if not os.path.isfile(CHART_PATH):
+    pytest.skip("Official type chart absent; historical damage integration tests need competition data", allow_module_level=True)
+CHART = load_type_chart(CHART_PATH)
+DEX = {  # Base stats and types as supplied in the dataset
     "snorlax": {"types": ["normal"], "hp": 160, "atk": 110, "def": 65, "spa": 65, "spd": 110, "spe": 30},
     "zapdos": {"types": ["electric", "flying"], "hp": 90, "atk": 90, "def": 85, "spa": 125, "spd": 90, "spe": 100},
     "skarmory": {"types": ["steel", "flying"], "hp": 65, "atk": 80, "def": 140, "spa": 40, "spd": 70, "spe": 70},
@@ -36,14 +39,14 @@ def mv(name, type_, bp, cat="physical", acc=1.0):
 
 def showdown_damage(att, dfn, move, level=100, crit=False, a_boost=0, d_boost=0, item=None, burned=False,
                     screen=False):
-    """Formula intera di Showdown Gen 2: lista dei 39 danni possibili (roll 217..255)."""
+    """Integer Showdown Gen 2 formula: 39 possible damage values (rolls 217..255)."""
     a, d = DEX[att], DEX[dfn]
     special = move["type"] in SPECIAL_TYPES
     A = calc_stat(a["spa" if special else "atk"], level)
     D = calc_stat(d["spd" if special else "def"], level)
     if item == "thickclub" and not special:
         A *= 2
-    ignore = crit and a_boost <= d_boost  # crit: ignora boost, screen e burn
+    ignore = crit and a_boost <= d_boost  # Critical hit: ignore boosts, screens and burn.
     if not ignore:
         A = int(A * boost_mult(a_boost))
         D = int(D * boost_mult(d_boost))
@@ -79,7 +82,7 @@ def mean_frac(att, dfn, move, **kw):
 
 
 def test_stat_formula():
-    # Snorlax L100, DV 15, stat exp massima: HP 523, Atk 318 (valori noti del calcolatore Gen 2)
+    # Snorlax L100 with DV 15 and maximum stat experience: HP 523, Atk 318 (Gen 2 calculator values)
     assert calc_stat(160, 100, hp=True) == 523
     assert calc_stat(110, 100) == 318
     assert calc_stat(30, 100) == 158
@@ -103,21 +106,21 @@ def test_damage_matches_showdown(att, dfn, move):
 def test_immunities():
     assert damage_frac(DEX, CHART, "snorlax", "gengar", mv("bodyslam", "normal", 85)) == 0
     assert damage_frac(DEX, CHART, "snorlax", "skarmory", mv("earthquake", "ground", 100)) == 0
-    # seismic toss (fighting) non colpisce i ghost; altrimenti danno = livello
+    # Seismic Toss (Fighting) cannot hit Ghost; otherwise damage equals level.
     assert damage_frac(DEX, CHART, "snorlax", "gengar", mv("seismictoss", "fighting", 0)) == 0
     assert damage_frac(DEX, CHART, "snorlax", "zapdos", mv("seismictoss", "fighting", 0)) == pytest.approx(100 / max_hp("zapdos"))
     assert damage_frac(DEX, CHART, "gengar", "snorlax", mv("nightshade", "ghost", 0)) == 0
 
 
 def test_category_by_type():
-    # in Gen 2 la categoria dipende dal tipo: crunch (dark) è speciale anche se il dato dice altro
+    # Gen 2 category depends on type: Crunch (Dark) is special even if the supplied category differs.
     ours = damage_frac(DEX, CHART, "tyranitar", "starmie", mv("crunch", "dark", 80, "physical"))
     ref = mean_frac("tyranitar", "starmie", mv("crunch", "dark", 80))
     assert abs(ours / ref - 1) < 0.03
 
 
 def test_fixed_power_moves():
-    # return/frustration a potenza massima 102, hiddenpower 70 col tipo inferito
+    # Return/Frustration use maximum power 102; Hidden Power uses power 70 and inferred type.
     ours = damage_frac(DEX, CHART, "snorlax", "zapdos", mv("return", "normal", 0))
     assert abs(ours / mean_frac("snorlax", "zapdos", mv("return", "normal", 102)) - 1) < 0.03
     ours = damage_frac(DEX, CHART, "zapdos", "tyranitar", mv("hiddenpower", "normal", 0), hp_type="ice")
@@ -138,7 +141,7 @@ def test_boost_multipliers():
 
 
 def test_type_chart_gen2():
-    # Gen 2: steel resiste ghost e dark; ghost immune a normal e fighting; ground immune a electric
+    # Gen 2: Steel resists Ghost/Dark; Ghost is immune to Normal/Fighting; Ground is immune to Electric.
     assert type_mult(CHART, "ghost", ["steel"]) == 0.5
     assert type_mult(CHART, "dark", ["steel"]) == 0.5
     assert type_mult(CHART, "normal", ["ghost"]) == 0

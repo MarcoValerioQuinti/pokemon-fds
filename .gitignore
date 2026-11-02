@@ -17,3 +17,15 @@ __pycache__/
 .idea/
 .vscode/
 .DS_Store
+
+# Local environments and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+kaggle.json
+*.pem
+*.key
+*.log
+

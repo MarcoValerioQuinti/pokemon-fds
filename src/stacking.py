@@ -1,11 +1,11 @@
-"""Stacking: base models eterogenei (alberi, lineari, kernel, generativi) + meta-modello.
+"""Stack heterogeneous base models (trees, linear, kernel and generative models).
 
-Le predizioni out-of-fold (OOF) di ogni base model sono calcolate con k-fold stratificato
-e salvate in outputs/oof/<nome>.npz, così si possono aggiungere modelli senza ricalcolare tutto.
+Generate stratified k-fold OOF probabilities per base model and cache them in
+outputs/oof/<name>.npz so new models can be added without recomputing everything.
 
-Uso:
-    python src/stacking.py --models lgbm,xgb,gmm   # calcola (o riusa) le OOF
-    python src/stacking.py --meta                  # valuta i meta-modelli e scrive la submission
+Usage:
+    python src/stacking.py --models lgbm,xgb,gmm   # compute or reuse OOF predictions
+    python src/stacking.py --meta                  # evaluate meta-models and write a submission
 """
 import argparse
 import os
@@ -35,16 +35,16 @@ sys.path.insert(0, os.path.dirname(__file__))
 from compute import catboost_params, configure, describe, fold_map, fold_plan, n_jobs, xgb_params
 from train import LGB_PARAMS, OUT, SEED, add_bags, get_features
 
-N_FOLDS = 5    # sovrascrivibile con --folds
-N_REPEATS = 1  # sovrascrivibile con --repeats (k-fold ripetuto con split diversi, OOF mediate)
+N_FOLDS = 5    # Override with --folds
+N_REPEATS = 1  # Override with --repeats: repeated k-fold with different splits, averaged OOF predictions
 OOF_DIR = os.path.join(OUT, "oof")
 
 
 class GMMClassifier(BaseEstimator, ClassifierMixin):
-    """Classificatore generativo: una GaussianMixture a covarianza piena per classe.
+    """Generative classifier: one full-covariance GaussianMixture per class.
 
-    La covarianza piena modella la distribuzione congiunta delle feature (non le
-    tratta come indipendenti come farebbe Naive Bayes); P(y|x) via teorema di Bayes.
+    Full covariance models the joint feature distribution rather than assuming
+    independence as Naive Bayes does. Compute P(y|x) using Bayes' theorem.
     """
 
     def __init__(self, n_components=3, covariance_type="full", reg_covar=1e-3, random_state=SEED):
@@ -72,10 +72,10 @@ class GMMClassifier(BaseEstimator, ClassifierMixin):
 
 
 class PLSProjection(BaseEstimator, TransformerMixin):
-    """Proiezione supervisionata (PLS): poche direzioni massimamente correlate col target.
+    """Supervised PLS projection onto a few target-correlated directions.
 
-    A differenza della PCA non scarta le direzioni discriminative; i GMM a valle
-    modellano la distribuzione congiunta in questo spazio ridotto.
+    Unlike PCA, it retains discriminative directions; downstream GMMs model
+    the joint distribution in this reduced space.
     """
 
     def __init__(self, n_components=4):
@@ -90,10 +90,10 @@ class PLSProjection(BaseEstimator, TransformerMixin):
 
 
 class NoisyFit(BaseEstimator, ClassifierMixin):
-    """Data augmentation: aggiunge copie del training set con rumore gaussiano.
+    """Augment training data with Gaussian-noise copies.
 
-    Il rumore è proporzionale alla deviazione standard di ogni feature continua
-    (le binarie restano intatte); serve a regolarizzare i modelli che overfittano.
+    Noise scales with each continuous feature's standard deviation; binary
+    features remain unchanged. This regularizes models prone to overfitting.
     """
 
     def __init__(self, estimator, sigma=0.1, n_copies=1, random_state=SEED):
@@ -117,7 +117,7 @@ class NoisyFit(BaseEstimator, ClassifierMixin):
         return self.estimator_.predict_proba(np.asarray(X, dtype=float))
 
 
-# regimi individuati dall'analisi degli errori OOF (src/analyze_errors.py): dove lo stack sbaglia di più
+# Regimes identified by OOF error analysis (src/analyze_errors.py): where the stack makes more errors
 REGIMES = {
     "attrition": lambda X: ((X.p1_n_statused + X.p2_n_statused) >= 3) | ((X.p1_rest_sleep + X.p2_rest_sleep) >= 2),
     "balanced": lambda X: X.diff_hp_sum.abs() < 0.75,
@@ -126,7 +126,7 @@ REGIMES = {
 
 
 class RegimeExpert(BaseEstimator, ClassifierMixin):
-    """Esperto di un regime: stesso modello, ma gli esempi fuori dal regime pesano `w_out`."""
+    """Regime expert: the same model, with out-of-regime rows weighted by `w_out`."""
 
     def __init__(self, estimator, regime, w_out=0.2):
         self.estimator = estimator
@@ -149,19 +149,19 @@ EXTRA_FILES = {"mc": "mc_features.pkl", "rec": "rec_features.pkl", "strat": "str
                "lon": "lon_features.pkl"}
 
 
-AUG_TURNS = (24, 26, 28)  # snapshot usati per l'augmentation (devono essere in train.SNAP_TURNS)
-AUG_WEIGHT = 0.5  # Fase 8: 0.25 vince nella stima annidata a 3 modelli ma non nello stack completo (0.6967 vs 0.6981)
+AUG_TURNS = (24, 26, 28)  # Augmentation snapshots; must be included in train.SNAP_TURNS.
+AUG_WEIGHT = 0.5  # Phase 8: weight 0.25 wins in the three-model nested estimate, but not the full stack (0.6967 vs 0.6981).
 
 
 def load_data(extra=()):
-    """Feature base + (opzionale) feature da simulazione Monte Carlo / modello ricorsivo.
+    """Base features plus optional Monte Carlo / recursive-model features.
 
-    Restituisce anche gli snapshot dei turni AUG_TURNS (solo train) con le stesse colonne,
-    usati dai modelli *_aug dentro i fold di training.
+    Also return train-only snapshots at AUG_TURNS with matching columns,
+    used by *_aug models inside their training folds.
     """
     base, snap = get_features(snapshots=True)
     snap = snap[snap.snap_turn.isin(AUG_TURNS)]
-    # bag calcolati insieme, così vocabolario e dummies coincidono
+    # Build bags jointly so vocabulary and dummy columns align.
     df = add_bags(pd.concat([base.assign(snap_turn=30), snap], ignore_index=True))
     for name in extra:
         ex = pd.read_pickle(os.path.join(OUT, EXTRA_FILES[name]))
@@ -193,7 +193,7 @@ XGB = dict(n_estimators=700, learning_rate=0.02, max_depth=4, subsample=0.8, col
 CAT = dict(iterations=1500, learning_rate=0.03, depth=6, l2_leaf_reg=5, random_seed=SEED, verbose=0)
 
 
-# factory dei modelli multi-thread: device e thread letti da compute al momento della creazione
+# Multithreaded model factories read device/thread settings from compute at creation time.
 def _lgb():
     return lgb.LGBMClassifier(**LGB_PARAMS, n_jobs=n_jobs())
 
@@ -206,9 +206,9 @@ def _cat():
     return CatBoostClassifier(**CAT, **catboost_params())
 
 
-# nome -> (feature set, factory)
+# name -> (feature set, factory)
 MODELS = {
-    # alberi su tutte le feature
+    # Trees on all features
     "lgbm": ("full", _lgb),
     "xgb": ("full", _xgb),
     "catboost": ("full", _cat),
@@ -216,10 +216,10 @@ MODELS = {
                                                              n_jobs=n_jobs(), random_state=SEED)),
     "rf": ("full_fill", lambda: RandomForestClassifier(800, min_samples_leaf=3, max_features=0.15,
                                                        n_jobs=n_jobs(), random_state=SEED)),
-    # alberi senza bag (feature selection: solo le feature di stato)
+    # Trees without bags: state-feature selection
     "lgbm_dense": ("dense", _lgb),
     "catboost_dense": ("dense", _cat),
-    # lineari / kernel / vicinato, con pipeline di normalizzazione
+    # Linear / kernel / nearest-neighbor models with normalization pipelines
     "logreg": ("full_fill", lambda: make_pipeline(StandardScaler(), LogisticRegression(C=0.02, max_iter=3000))),
     "logreg_dense": ("dense", lambda: make_pipeline(QuantileTransformer(output_distribution="normal", random_state=SEED),
                                                     LogisticRegression(C=0.05, max_iter=3000))),
@@ -227,7 +227,7 @@ MODELS = {
                                                                  random_state=SEED))),
     "knn": ("dense", lambda: make_pipeline(StandardScaler(), PCA(30, random_state=SEED),
                                            KNeighborsClassifier(150, weights="distance"))),
-    # generativi gaussiani (distribuzione congiunta, covarianza piena)
+    # Gaussian generative models of the joint distribution with full covariance
     "lda": ("dense", lambda: make_pipeline(StandardScaler(), LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto"))),
     "qda": ("dense", lambda: make_pipeline(QuantileTransformer(output_distribution="normal", random_state=SEED),
                                            PCA(20, random_state=SEED), QuadraticDiscriminantAnalysis(reg_param=0.1))),
@@ -235,13 +235,13 @@ MODELS = {
                                            PLSProjection(4), GMMClassifier(n_components=1, reg_covar=1e-2))),
     "gmm_mix": ("dense", lambda: make_pipeline(QuantileTransformer(output_distribution="normal", random_state=SEED),
                                                PLSProjection(2), GMMClassifier(n_components=6, reg_covar=1e-2))),
-    # versioni con rumore gaussiano (regolarizzazione)
+    # Gaussian-noise regularization variants
     "lgbm_noise": ("dense", lambda: NoisyFit(_lgb(), sigma=0.1, n_copies=2)),
     "xgb_noise": ("full_fill", lambda: NoisyFit(_xgb(), sigma=0.1, n_copies=1)),
-    # esperti condizionali (Fase 7): un LGBM per regime
+    # Conditional experts (Phase 7): one LGBM per regime
     **{f"lgbm_exp_{r}": ("full", (lambda r=r: RegimeExpert(_lgb(), r))) for r in ("attrition", "balanced", "setup")},
 }
-# modelli single-thread: i loro fold girano in parallelo (joblib/loky, portabile su ogni OS)
+# Single-threaded models run folds in parallel using portable joblib/loky workers.
 PARALLEL_FOLDS = {"logreg", "logreg_dense", "svm", "knn", "lda", "qda", "gmm", "gmm_mix"}
 
 
@@ -259,9 +259,9 @@ def get_snap(sets, kind):
 
 
 def run_oof(name, sets, y):
-    """OOF di un base model. I nomi *_aug usano il modello base con l'augmentation:
-    agli esempi del fold di train si aggiungono i loro snapshot (peso AUG_WEIGHT);
-    la validazione resta sul solo turno 30."""
+    """Generate base-model OOF probabilities. *_aug names add training snapshots
+    from that fold's training battles with weight AUG_WEIGHT; validation uses
+    only the turn-30 state."""
     path = os.path.join(OOF_DIR, f"{name}.npz")
     if os.path.exists(path):
         d = np.load(path)
@@ -290,7 +290,7 @@ def run_oof(name, sets, y):
     res = fold_map(fit_fold, [(tr, va) for _, tr, va in splits], *fold_plan(base, base in PARALLEL_FOLDS))
     oof, pte = np.zeros(len(y)), np.zeros(len(Xte))
     for (_, _, va), (p_va, p_te, _) in zip(splits, res):
-        oof[va] += p_va / N_REPEATS  # con k-fold ripetuto, media delle OOF dei diversi split
+        oof[va] += p_va / N_REPEATS  # Repeated k-fold: average OOF predictions across splits.
         pte += p_te / len(splits)
     tr_acc = [r[2] for r in res]
     acc = ((oof > 0.5) == y).mean()
@@ -301,11 +301,11 @@ def run_oof(name, sets, y):
 
 
 def meta_eval(names, y, n_repeats=5):
-    """Valuta i meta-modelli sulle OOF con k-fold ripetuto (seed diverso dai base model)."""
+    """Evaluate meta-models on OOF values with repeated k-fold CV and a different seed."""
     P = {n: np.load(os.path.join(OOF_DIR, f"{n}.npz")) for n in names}
     Z = np.column_stack([logit(np.clip(P[n]["oof"], 1e-4, 1 - 1e-4)) for n in names])
     Zte = np.column_stack([logit(np.clip(P[n]["test"], 1e-4, 1 - 1e-4)) for n in names])
-    # validazione del meta fissa (5x5) per confrontare run con --folds/--repeats diversi
+    # Fixed 5x5 meta-validation to compare runs with different --folds/--repeats
     rskf = RepeatedStratifiedKFold(n_splits=5, n_repeats=n_repeats, random_state=SEED + 1)
     metas = {
         "mean": None,
@@ -330,13 +330,13 @@ def meta_eval(names, y, n_repeats=5):
         results[mname] = (np.mean(accs), np.std(accs))
         print(f"meta {mname:15s} acc {np.mean(accs):.4f} ± {np.std(accs):.4f}")
     lr = LogisticRegression(C=1.0, max_iter=2000).fit(Z, y)
-    print("pesi logreg_meta:", dict(zip(names, np.round(lr.coef_[0], 3))))
+    print("logreg_meta weights:", dict(zip(names, np.round(lr.coef_[0], 3))))
     return results, Z, Zte
 
 
 def duplicate_override(test_ids, pred):
-    """Battaglie di test identiche (team, lead e timeline) a una di train ricevono l'etichetta
-    di quella: nelle 17 coppie duplicate interne al train l'etichetta coincide sempre."""
+    """Assign the known label to test battles identical to a training battle
+    (team, lead and timeline). All 17 within-train duplicate pairs have matching labels."""
     import hashlib, json
     from features import load_jsonl
     from train import DATA
@@ -351,7 +351,7 @@ def duplicate_override(test_ids, pred):
         if k in known:
             pred[pos[b["battle_id"]]] = known[k]
             n += 1
-    print(f"{n} battaglie di test duplicate di battaglie di train: etichetta copiata")
+    print(f"{n} test battles duplicate training battles: known label copied")
     return pred
 
 
@@ -359,14 +359,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="")
     ap.add_argument("--meta", action="store_true")
-    ap.add_argument("--no-submit", action="store_true", help="valuta il meta senza scrivere la submission")
-    ap.add_argument("--use", default="", help="base model da usare nel meta (default: tutti quelli in cache)")
-    ap.add_argument("--extra", default="", help="feature aggiuntive: mc,rec")
-    ap.add_argument("--folds", type=int, default=5, help="numero di fold dei base model")
-    ap.add_argument("--repeats", type=int, default=1, help="ripetizioni del k-fold con split diversi")
-    ap.add_argument("--n-jobs", type=int, default=0, help="processi/thread (default: tutti i core)")
+    ap.add_argument("--no-submit", action="store_true", help="evaluate the meta-model without writing a submission")
+    ap.add_argument("--use", default="", help="base models for the meta-model (default: all cached models)")
+    ap.add_argument("--extra", default="", help="additional features: mc,rec")
+    ap.add_argument("--folds", type=int, default=5, help="number of base-model folds")
+    ap.add_argument("--repeats", type=int, default=1, help="k-fold repetitions with different splits")
+    ap.add_argument("--n-jobs", type=int, default=0, help="processes/threads (default: all cores)")
     ap.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"],
-                    help="cuda: XGBoost e CatBoost su GPU NVIDIA (Linux/Windows)")
+                    help="cuda: XGBoost and CatBoost on NVIDIA GPU (Linux/Windows)")
     args = ap.parse_args()
     configure(args.n_jobs, args.device)
     print(describe(), flush=True)
@@ -399,7 +399,7 @@ def main():
         fname = f"submission_stacking{'_' + tag if tag else ''}.csv"
         pd.DataFrame({"battle_id": test_ids, "player_won": pred.astype(int)}).to_csv(
             os.path.join(OUT, fname), index=False)
-        print(f"{fname} scritta con {best} (CV {results[best][0]:.4f})")
+        print(f"{fname} written with {best} (CV {results[best][0]:.4f})")
 
 
 if __name__ == "__main__":

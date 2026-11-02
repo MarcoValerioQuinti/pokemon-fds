@@ -1,18 +1,18 @@
-"""Valutazione annidata (nested CV) dell'intera pipeline di stacking.
+"""Nested cross-validation of the complete stacking procedure.
 
-Per ogni fold esterno (5, stratificato, seed 42):
-  1. i fold interni (5) sul solo training esterno danno le OOF interne dei base model;
-  2. il meta-modello (scelto a priori: logreg sui logit) si allena su quelle OOF;
-  3. i base model, riaddestrati su tutto il training esterno, predicono il fold esterno;
-  4. il meta combina queste predizioni: una sola predizione esterna per battaglia.
-Le etichette del fold esterno non toccano né i base model, né il meta, né la soglia (0.5).
+For each outer fold (5 stratified folds, seed 42):
+  1. Five inner folds on outer-training rows generate base-model OOF predictions.
+  2. The predetermined meta-model (logistic regression on logits) fits those OOF values.
+  3. Base models refitted on all outer-training rows predict the outer fold.
+  4. The meta-model combines them into one outer prediction per battle.
+Outer-fold labels do not enter base fits, meta fits or threshold selection (0.5).
 
-I duplicati esatti (stessa timeline) finiscono sempre nello stesso fold, sia esterno sia interno.
+Exact duplicate timelines stay in the same fold, both internally and externally.
 
-Uso:
+Usage:
     python src/evaluate_nested.py --name base4 --models logreg,lgbm,xgb,catboost --extra mc,rec
-    python src/evaluate_nested.py --compare base4 altro   # differenza appaiata + bootstrap
-Output in outputs/experiments/<name>/: predictions.csv, metrics.json, config.json.
+    python src/evaluate_nested.py --compare base4 other   # paired difference + bootstrap
+Outputs in outputs/experiments/<name>/: predictions.csv, metrics.json, config.json.
 """
 import argparse
 import hashlib
@@ -40,7 +40,7 @@ N_OUTER = N_INNER = 5
 
 
 def duplicate_groups(battles):
-    """Gruppo per battaglia: battaglie con timeline identica condividono il gruppo."""
+    """Group battles with identical timelines."""
     first = {}
     groups = []
     for i, b in enumerate(battles):
@@ -50,7 +50,7 @@ def duplicate_groups(battles):
 
 
 def make_folds(y, groups, n, seed):
-    """StratifiedKFold standard; poi i duplicati seguono il fold del primo del gruppo."""
+    """Standard StratifiedKFold, then assign duplicates to the first member's fold."""
     fold = np.empty(len(y), int)
     for k, (_, va) in enumerate(StratifiedKFold(n, shuffle=True, random_state=seed).split(np.zeros(len(y)), y)):
         fold[va] = k
@@ -61,14 +61,14 @@ def make_folds(y, groups, n, seed):
 
 
 def fit_predict(name, sets, y, tr, ev):
-    """Allena il base model `name` sulle righe tr del train (con snapshot se *_aug) e predice ev."""
+    """Fit base model `name` on training rows tr (with snapshots for *_aug) and predict ev."""
     aug = name.endswith("_aug")
     base = name[:-4] if aug else name
     kind, make = MODELS[base]
     X, _ = get_X(sets, kind)
     if aug:
         S = get_snap(sets, kind)
-        sm = np.isin(sets["snap_ids"], sets["train_ids"][tr])  # snapshot dei soli battle di training
+        sm = np.isin(sets["snap_ids"], sets["train_ids"][tr])  # Only snapshots belonging to training battles
         Xa = pd.concat([X.iloc[tr], S[sm]], ignore_index=True)
         ya = np.concatenate([y[tr], sets["snap_y"][sm]])
         wa = np.concatenate([np.ones(len(tr)), np.full(sm.sum(), stacking.AUG_WEIGHT)])
@@ -79,8 +79,8 @@ def fit_predict(name, sets, y, tr, ev):
 
 
 def run_model(name, sets, y, outer, inner):
-    """Per un base model: OOF interne (per il meta) e predizioni esterne."""
-    jobs = []  # (fold esterno, indici train, indici da predire, tipo)
+    """Generate inner OOF predictions (for the meta-model) and outer predictions for one base model."""
+    jobs = []  # (outer fold, train indices, prediction indices, prediction kind)
     for k in range(N_OUTER):
         tr_o = np.where(outer != k)[0]
         jobs.append((k, tr_o, np.where(outer == k)[0], "outer"))
@@ -110,7 +110,7 @@ def metrics(y, p, fold):
 
 
 def select_columns(sets, keep=(), drop=()):
-    """Restringe le feature: solo le colonne con prefisso in keep (se dato), senza quelle in drop."""
+    """Keep only feature columns with a prefix in keep, if provided, and exclude prefixes in drop."""
     def f(X):
         cols = [c for c in X.columns if (not keep or c.startswith(tuple(keep))) and not c.startswith(tuple(drop))]
         return X[cols]
@@ -122,8 +122,8 @@ def select_columns(sets, keep=(), drop=()):
 
 
 def meta_inputs(models, P, regimes, R):
-    """Logit dei base model; con il gating, anche gli indicatori di regime e le interazioni
-    regime x logit dell'esperto corrispondente (il meta impara quanto fidarsi dell'esperto)."""
+    """Base-model logits; with gating, also regime indicators and interactions between
+    each regime and its expert's logits, allowing the meta-model to learn expert reliability."""
     Z = [_z(P[m]) for m in models]
     for r in regimes:
         Z.append(R[r])
@@ -141,7 +141,7 @@ def evaluate(name, models, extra, keep=(), drop=(), gate=()):
     sets, y, _ = load_data(extra)
     if keep or drop:
         sets = select_columns(sets, keep, drop)
-        print(f"feature selezionate: {sets['full'][0].shape[1]} (keep={keep}, drop={drop})")
+        print(f"selected features: {sets['full'][0].shape[1]} (keep={keep}, drop={drop})")
     train = load_jsonl(os.path.join(DATA, "train.jsonl"))
     assert [b["battle_id"] for b in train] == list(sets["train_ids"])
     groups = duplicate_groups(train)
@@ -152,7 +152,7 @@ def evaluate(name, models, extra, keep=(), drop=(), gate=()):
         f = np.full(len(y), -1)
         f[tr_o] = make_folds(y[tr_o], groups[tr_o], N_INNER, SEED + 100 + k)
         inner[k] = f
-    print(f"{len(set(groups))} gruppi su {len(y)} battaglie (duplicati nello stesso fold)", flush=True)
+    print(f"{len(set(groups))} groups across {len(y)} battles (duplicates kept in the same fold)", flush=True)
 
     inner_oof, outer_pred = {}, {}
     for m in models:
@@ -194,12 +194,12 @@ def evaluate(name, models, extra, keep=(), drop=(), gate=()):
     s = res["stack"]
     print(f"\nNESTED stack (logreg) acc {s['acc']:.4f} | AUC {s['auc']:.4f} | logloss {s['logloss']:.4f}")
     print("  per fold:", " ".join(f"{a:.4f}" for a in s["acc_per_fold"]))
-    print(f"NESTED media dei logit acc {res['mean']['acc']:.4f}")
+    print(f"NESTED mean-logit accuracy {res['mean']['acc']:.4f}")
     return res
 
 
 def compare(a, b, n_boot=5000):
-    """Differenza appaiata di accuracy (b - a) sulle stesse battaglie, con IC bootstrap al 95%."""
+    """Paired accuracy difference (b - a) on the same battles, with a 95% bootstrap CI."""
     A = pd.read_csv(os.path.join(EXP, a, "predictions.csv"))
     B = pd.read_csv(os.path.join(EXP, b, "predictions.csv"))
     assert (A.battle_id.values == B.battle_id.values).all()
@@ -210,11 +210,11 @@ def compare(a, b, n_boot=5000):
     boot = np.array([d[rng.integers(0, len(d), len(d))].mean() for _ in range(n_boot)])
     lo, hi = np.percentile(boot, [2.5, 97.5])
     per_fold = [d[A.fold.values == k].mean() for k in range(N_OUTER)]
-    print(f"{a}: {ca.mean():.4f}  {b}: {cb.mean():.4f}  diff {d.mean():+.4f}  IC95 [{lo:+.4f}, {hi:+.4f}]  "
+    print(f"{a}: {ca.mean():.4f}  {b}: {cb.mean():.4f}  diff {d.mean():+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}]  "
           f"P(diff>0) {np.mean(boot > 0):.2f}")
     print("  diff per fold:", " ".join(f"{x:+.4f}" for x in per_fold))
-    print(f"  battaglie: {int(((cb == 1) & (ca == 0)).sum())} corrette solo da {b}, "
-          f"{int(((ca == 1) & (cb == 0)).sum())} solo da {a}")
+    print(f"  battles: {int(((cb == 1) & (ca == 0)).sum())} correct only with {b}, "
+          f"{int(((ca == 1) & (cb == 0)).sum())} only with {a}")
     return d.mean(), (lo, hi), per_fold
 
 
@@ -223,10 +223,10 @@ def main():
     ap.add_argument("--name", default="")
     ap.add_argument("--models", default="logreg,lgbm,xgb,catboost")
     ap.add_argument("--extra", default="mc,rec")
-    ap.add_argument("--keep", default="", help="prefissi delle sole feature da usare (es. strat_,prob_)")
-    ap.add_argument("--drop", default="", help="prefissi delle feature da escludere")
-    ap.add_argument("--gate", default="", help="regimi per il gating del meta (attrition,balanced,setup)")
-    ap.add_argument("--aug-weight", type=float, default=None, help="peso degli snapshot nei modelli *_aug")
+    ap.add_argument("--keep", default="", help="keep only features with these prefixes (e.g. strat_,prob_)")
+    ap.add_argument("--drop", default="", help="feature prefixes to exclude")
+    ap.add_argument("--gate", default="", help="meta gating regimes (attrition,balanced,setup)")
+    ap.add_argument("--aug-weight", type=float, default=None, help="snapshot weight in *_aug models")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
     ap.add_argument("--n-jobs", type=int, default=0)
     ap.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])

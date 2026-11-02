@@ -1,15 +1,15 @@
-"""Modello finale: lo stack ridotto ai componenti che convengono (report reports/02_report_costi_benefici).
+"""Final model: the stack reduced to useful components (reports/02_report_costi_benefici).
 
-Tiene solo i base model diversi tra loro (boosting con augmentation, ExtraTrees, RF, lineari) e toglie
-quelli ridondanti o senza resa misurabile (svm, knn, qda, GMM, varianti con rumore, boosting senza
-augmentation, esperti di regime) e le feature strategiche/longitudinali. Tiene invece le feature del
-Monte Carlo e del modello ricorsivo (--extra mc,rec, default): con i modelli _aug, calcolate anche sugli
-snapshot, valgono +0.44 punti (stack finale 0.6994 con mc,rec contro 0.6937 senza, McNemar p = 0.11).
+Keep diverse base models (augmented boosting, ExtraTrees, RF and linear models) and remove
+redundant or unhelpful ones (svm, knn, qda, GMM, noise variants, non-augmented boosting,
+regime experts) and strategic/longitudinal features. Retain Monte Carlo and recursive
+features (--extra mc,rec, default): also computed for augmented snapshots, they add
+0.44 percentage points (final stack 0.6994 with mc,rec vs 0.6937 without; McNemar p = 0.11).
 
-Confronta lo stack finale con quello di riferimento (22 modelli + mc,rec) sulle stesse battaglie
-(differenza appaiata con IC bootstrap e McNemar) e scrive outputs/submission_final.csv.
+Compare the final stack with the reference (22 models + mc,rec) on the same battles
+(paired difference, bootstrap CI and McNemar) and write outputs/submission_final.csv.
 
-Uso: python src/final_model.py [--extra mc,rec] [--n-jobs N] [--device auto|cpu|cuda]
+Usage: python src/final_model.py [--extra mc,rec] [--n-jobs N] [--device auto|cpu|cuda]
 """
 import argparse
 import os
@@ -29,7 +29,7 @@ from train import OUT, SEED
 
 FINAL_MODELS = ["lgbm_aug", "xgb_aug", "lgbm_dense_aug", "catboost_aug", "catboost_dense_aug",
                 "extratrees", "rf", "lda", "logreg", "logreg_dense"]
-REFERENCE = os.path.join(OUT, "oof_mc_rec")  # stack a 22 modelli, miglior risultato precedente
+REFERENCE = os.path.join(OUT, "oof_mc_rec")  # 22-model stack: previous best reference
 
 
 def logits(d, names, key="oof"):
@@ -38,8 +38,8 @@ def logits(d, names, key="oof"):
 
 
 def meta_oof(Z, y, repeats=5):
-    """Accuracy del meta (logreg sui logit) con 5-fold ripetuto (seed 43, come stacking.meta_eval)
-    e predizione OOF mediata sulle ripetizioni, per i confronti appaiati."""
+    """Evaluate the logistic meta-model on logits with repeated 5-fold CV (seed 43,
+    as in stacking.meta_eval); average repeated OOF predictions for paired comparisons."""
     accs, pm = [], np.zeros(len(y))
     for a, b in RepeatedStratifiedKFold(n_splits=5, n_repeats=repeats, random_state=SEED + 1).split(Z, y):
         p = LogisticRegression(C=1.0, max_iter=2000).fit(Z[a], y[a]).predict_proba(Z[b])[:, 1]
@@ -58,7 +58,7 @@ def paired(ok_ref, ok_new, n_boot=5000, seed=0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--extra", default="mc,rec", help="feature aggiuntive; \"\" per nessuna (-0.44 punti, vedi docstring)")
+    ap.add_argument("--extra", default="mc,rec", help="additional features; \"\" for none (-0.44 points; see docstring)")
     ap.add_argument("--out", default="submission_final.csv")
     ap.add_argument("--n-jobs", type=int, default=0)
     ap.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
@@ -66,7 +66,7 @@ def main():
     configure(args.n_jobs, args.device)
     print(describe(), flush=True)
     extra = [e for e in args.extra.split(",") if e]
-    # stessa cartella di cache di stacking.py: le OOF di un modello con le stesse feature coincidono
+    # Reuse the stacking.py cache: identical model/features produce identical OOF values.
     stacking.OOF_DIR = os.path.join(OUT, "oof_" + "_".join(extra) if extra else "oof_final")
     os.makedirs(stacking.OOF_DIR, exist_ok=True)
     sets, y, test_ids = stacking.load_data(extra)
@@ -75,20 +75,20 @@ def main():
 
     Z, Zte = logits(stacking.OOF_DIR, FINAL_MODELS), logits(stacking.OOF_DIR, FINAL_MODELS, "test")
     acc, sd, pm = meta_oof(Z, y)
-    print(f"\nstack finale ({len(FINAL_MODELS)} modelli, extra={extra or 'nessuna'}): meta logreg {acc:.4f} ± {sd:.4f}")
-    # confronto con lo stack a 22 solo se le sue OOF sono in cache (non su un ambiente nuovo, es. Kaggle)
+    print(f"\nfinal stack ({len(FINAL_MODELS)} models, extra={extra or 'none'}): meta logreg {acc:.4f} ± {sd:.4f}")
+    # Compare with the 22-model stack only if cached, not on a fresh environment such as Kaggle.
     ref_names = sorted(f[:-4] for f in os.listdir(REFERENCE) if f.endswith(".npz")) if os.path.isdir(REFERENCE) else []
     if set(ref_names) > set(FINAL_MODELS):
         ref_acc, ref_sd, pr = meta_oof(logits(REFERENCE, ref_names), y)
         d, lo, hi, p = paired((pr > 0.5) == y, (pm > 0.5) == y)
-        print(f"riferimento ({len(ref_names)} modelli, mc,rec): {ref_acc:.4f} ± {ref_sd:.4f}")
-        print(f"differenza finale - riferimento: {d * 100:+.2f} punti, IC95% [{lo * 100:+.2f}, {hi * 100:+.2f}], McNemar p = {p:.3f}")
+        print(f"reference ({len(ref_names)} models, mc,rec): {ref_acc:.4f} ± {ref_sd:.4f}")
+        print(f"final - reference difference: {d * 100:+.2f} points, 95% CI [{lo * 100:+.2f}, {hi * 100:+.2f}], McNemar p = {p:.3f}")
 
     meta = LogisticRegression(C=1.0, max_iter=2000).fit(Z, y)
-    print("pesi del meta:", dict(zip(FINAL_MODELS, np.round(meta.coef_[0], 3))))
+    print("meta-model weights:", dict(zip(FINAL_MODELS, np.round(meta.coef_[0], 3))))
     pred = stacking.duplicate_override(test_ids, meta.predict(Zte))
     pd.DataFrame({"battle_id": test_ids, "player_won": pred.astype(int)}).to_csv(os.path.join(OUT, args.out), index=False)
-    print(f"{args.out} scritta: {len(pred)} righe, p1 vince nel {pred.mean():.1%}")
+    print(f"{args.out} written: {len(pred)} rows, p1 win rate {pred.mean():.1%}")
 
 
 if __name__ == "__main__":
