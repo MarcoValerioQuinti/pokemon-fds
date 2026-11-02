@@ -1,15 +1,15 @@
-"""Storia per singolo pokemon fino all'ultimo turno osservato (Fase 6).
+"""Per-Pokemon history up to the last observed turn (Phase 6).
 
-Per ogni pokemon visto si traccia, turno per turno:
-  - ingressi e turni in campo; HP all'ingresso;
-  - danno subito, recupero (cure e leftovers), danno inflitto attribuito alle sue mosse reali;
-  - turni con status (sonno separato), boost massimi, ingressi con le spikes;
-  - mosse riportate ma non eseguite (persistenti, features.get_actual_move) tenute separate da quelle reali.
-Le mosse reali servono solo ad attribuire danni ed effetti; il conteggio delle persistenti resta
-come feature di comportamento. Le storie vengono aggregate per lato con max/media/quantili e conteggi
-sopra soglia, così una singola win condition non sparisce nella media.
+For each observed Pokemon, track turn by turn:
+  - entries, turns on the field and entry HP;
+  - damage taken, recovery (healing and leftovers), damage attributed to actual moves;
+  - status turns (sleep separately), maximum boosts and entries into spikes;
+  - persistent reported moves kept separate from executed moves (features.get_actual_move).
+Actual moves only attribute damage and effects; persistent counts remain behavioral features.
+Aggregate histories per side using maxima, means, quantiles and threshold counts so that a
+single win condition is not lost in an average.
 
-Uso: python src/longitudinal.py  ->  outputs/lon_features.pkl (turno 30 + snapshot 24/26/28 di train)
+Usage: python src/longitudinal.py -> outputs/lon_features.pkl (turn 30 and train snapshots 24/26/28)
 """
 import argparse
 import os
@@ -32,7 +32,7 @@ _W = {}
 
 
 def histories(b):
-    """Dizionario lato -> specie -> statistiche cumulative."""
+    """Dictionary mapping side -> species -> cumulative statistics."""
     dex = _W["dex"]
     H = {s: defaultdict(lambda: dict(entries=0, turns=0, hp_entry_min=1.0, dmg_taken=0.0, healed=0.0,
                                      dmg_dealt=0.0, kos=0, status_turns=0, sleep_turns=0, max_boost=0,
@@ -74,7 +74,7 @@ def histories(b):
                     spikes[o] = True
                 elif m["name"] == "rapidspin":
                     spikes[s] = False
-            # danno inflitto: calo di HP dell'avversario rimasto in campo, se questo pokemon ha agito
+            # Attribute damage to a real action when the opponent stays on the field.
             if prev is not None and m is not None and m["category"] != "status":
                 po, co = prev[o + "_pokemon_state"], t[o + "_pokemon_state"]
                 if po["name"] == co["name"]:
@@ -98,10 +98,10 @@ def side_features(H, side, team, alive_names, active, now):
     alive = [H[side][n] for n in alive_names if n in H[side]]
     f[f"lon_{side}_alive_dmg_dealt_max"] = max((m["dmg_dealt"] for m in alive), default=0.0)
     f[f"lon_{side}_alive_dmg_dealt_q75"] = np.percentile([m["dmg_dealt"] for m in alive], 75) if alive else 0.0
-    f[f"lon_{side}_n_strong_attackers"] = sum(m["dmg_dealt"] >= 0.8 for m in alive)  # vivi che hanno fatto molto danno
+    f[f"lon_{side}_n_strong_attackers"] = sum(m["dmg_dealt"] >= 0.8 for m in alive)  # Living Pokemon that dealt substantial damage
     f[f"lon_{side}_n_healthy_unused"] = sum(1 for n in alive_names if n not in H[side]) + \
-        sum(m["hp"] > 0.7 and m["turns"] <= 3 for m in alive)  # vivi poco usati e in salute
-    f[f"lon_{side}_n_worn"] = sum(m["dmg_taken"] >= 1.0 and m["hp"] > 0 for m in alive)  # logorati ma vivi
+        sum(m["hp"] > 0.7 and m["turns"] <= 3 for m in alive)  # Little-used, healthy living Pokemon
+    f[f"lon_{side}_n_worn"] = sum(m["dmg_taken"] >= 1.0 and m["hp"] > 0 for m in alive)  # Worn down but still alive
     a = H[side].get(active)
     f[f"lon_{side}_active_turns"] = a["turns"] if a else 0
     f[f"lon_{side}_active_dmg_last5"] = sum(d for tt, d in a["recent"] if tt > now - 5) if a else 0.0

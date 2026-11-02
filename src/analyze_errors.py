@@ -1,12 +1,12 @@
-"""Analisi degli errori OOF di un esperimento (outputs/experiments/<nome>/predictions.csv).
+"""OOF error analysis for an experiment (outputs/experiments/<name>/predictions.csv).
 
-Produce in outputs/experiments/<nome>/:
-  errors.csv          battaglie sbagliate con probabilità, margine e feature di stato principali
-  error_slices.csv    accuracy per fasce delle feature di stato (HP, KO, non visti, status, spikes, boost, duello)
-  model_pairs.csv     per ogni coppia di base model: quante volte uno corregge l'altro, correlazione degli errori
-  error_report.txt    riepilogo leggibile
+Writes to outputs/experiments/<name>/:
+  errors.csv          misclassified battles with probabilities, margins and key state features
+  error_slices.csv    accuracy by state-feature bins (HP, KOs, unseen, status, spikes, boosts, duel)
+  model_pairs.csv     pairwise error corrections and error correlations for base models
+  error_report.txt    human-readable summary
 
-Uso: python src/analyze_errors.py --name nested_full
+Usage: python src/analyze_errors.py --name nested_full
 """
 import argparse
 import itertools
@@ -26,7 +26,7 @@ KEY = ["diff_hp_sum", "diff_fainted", "p1_fainted", "p2_fainted", "p2_n_unseen",
 
 
 def slices(df, correct, conf):
-    """Accuracy per fasce: quantili per le continue, valori per le discrete."""
+    """Accuracy by bins: quantiles for continuous features, values for discrete features."""
     rows = []
     act_boost = df.p1_active_boost_sum - df.p2_active_boost_sum
     spec = {
@@ -80,23 +80,23 @@ def main():
     mp = model_pairs(pred, y)
     mp.to_csv(os.path.join(d, "model_pairs.csv"), index=False)
 
-    lines = [f"esperimento {args.name}: accuracy stack {correct.mean():.4f}, errori {(~correct).sum()}"]
+    lines = [f"experiment {args.name}: stack accuracy {correct.mean():.4f}, errors {(~correct).sum()}"]
     for lo, hi in [(0.3, 0.5), (0.2, 0.3), (0.1, 0.2), (0, 0.1)]:
         m = (conf > lo) & (conf <= hi) if lo else conf <= hi
-        lines.append(f"  |p-0.5| in ({lo}, {hi}]: {m.sum():5d} battaglie, accuracy {correct[m].mean():.3f}, "
-                     f"{(~correct[m]).sum()} errori")
-    # errori sicuri: in quale direzione e con quale stato
+        lines.append(f"  |p-0.5| in ({lo}, {hi}]: {m.sum():5d} battles, accuracy {correct[m].mean():.3f}, "
+                     f"{(~correct[m]).sum()} errors")
+    # Confident errors: prediction direction and associated battle state
     bad = (~correct) & (conf > 0.25)
-    lines.append(f"errori con alta confidenza (|p-0.5|>0.25): {bad.sum()}; "
-                 f"previsto p1 vince ma perde: {(bad & (p > 0.5)).sum()}, viceversa: {(bad & (p < 0.5)).sum()}")
-    cmp = pd.DataFrame({"tutti": feat[KEY].mean(), "errori_sicuri": feat[KEY][bad].mean(),
-                        "corretti_sicuri": feat[KEY][correct & (conf > 0.25)].mean()})
+    lines.append(f"high-confidence errors (|p-0.5|>0.25): {bad.sum()}; "
+                 f"predicted p1 win but observed loss: {(bad & (p > 0.5)).sum()}, reverse: {(bad & (p < 0.5)).sum()}")
+    cmp = pd.DataFrame({"all": feat[KEY].mean(), "confident_errors": feat[KEY][bad].mean(),
+                        "confident_correct": feat[KEY][correct & (conf > 0.25)].mean()})
     lines.append(cmp.round(3).to_string())
-    lines.append("\naccuracy per fascia:")
+    lines.append("\naccuracy by bin:")
     lines.append(sl.round(3).to_string(index=False))
-    lines.append("\ncoppie di modelli meno correlate negli errori:")
+    lines.append("\nmodel pairs with the least correlated errors:")
     lines.append(mp.head(10).round(4).to_string(index=False))
-    lines.append("coppie più correlate:")
+    lines.append("most correlated pairs:")
     lines.append(mp.tail(5).round(4).to_string(index=False))
     txt = "\n".join(lines)
     with open(os.path.join(d, "error_report.txt"), "w") as f:

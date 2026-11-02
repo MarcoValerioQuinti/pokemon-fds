@@ -1,6 +1,6 @@
-"""Training + CV dei modelli e generazione della submission.
+"""Model training, cross-validation and submission generation.
 
-Uso: python src/train.py [--tune N_TRIALS]
+Usage: python src/train.py [--tune N_TRIALS]
 """
 import argparse
 import os
@@ -22,15 +22,15 @@ from compute import catboost_params, configure, describe, xgb_params
 from features import build_context, build_frame, build_pokedex, clean_battles, load_jsonl, load_type_chart
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-DATA = os.environ.get("POKEMON_DATA", os.path.join(ROOT, "data"))  # su Kaggle: /kaggle/input/...
+DATA = os.environ.get("POKEMON_DATA", os.path.join(ROOT, "data"))  # On Kaggle: /kaggle/input/...
 OUT = os.environ.get("POKEMON_OUT", os.path.join(ROOT, "outputs"))
 SEED = 42
 N_FOLDS = 5
 
 
 SNAP_TURNS = (20, 22, 24, 26, 28)
-# Pulizia delle mosse persistenti (features.clean_battles): corretta come meccanica di gioco ma
-# peggiora la CV di ~0.4 punti (le mosse "ripetute" portano segnale), quindi disattivata.
+# Cleaning persistent moves (features.clean_battles) matches game mechanics but
+# reduces CV by ~0.4 points: repeated moves carry signal, so cleaning is disabled.
 CLEAN_MOVES = False
 
 
@@ -44,9 +44,9 @@ def _load_clean():
 
 
 def get_features(snapshots=False):
-    """Feature al turno 30 (train+test). Con snapshots=True anche le feature dei soli
-    battle di train troncati ai turni SNAP_TURNS, per l'augmentation (colonna snap_turn)."""
-    os.makedirs(OUT, exist_ok=True)  # outputs/ non è versionata: su un clone pulito non esiste
+    """Turn-30 features for train+test. With snapshots=True, also return training
+    battles truncated at SNAP_TURNS for augmentation (snap_turn column)."""
+    os.makedirs(OUT, exist_ok=True)  # outputs/ is untracked and absent on a fresh clone.
     cache = os.path.join(OUT, "features.pkl")
     snap_cache = os.path.join(OUT, "features_snap.pkl")
     if os.path.exists(cache) and (not snapshots or os.path.exists(snap_cache)):
@@ -70,7 +70,7 @@ def get_features(snapshots=False):
 
 
 def add_bags(df, min_df=20):
-    """Bag-of-pokemon / bag-of-moves come colonne di conteggio."""
+    """Pokemon and move bags represented as count columns."""
     parts = [df]
     for col in [c for c in df.columns if c.startswith("_")]:
         cv = CountVectorizer(token_pattern=r"\S+", min_df=min_df)
@@ -132,7 +132,7 @@ def tune_lgb(X, y, n_trials):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tune", type=int, default=0)
-    ap.add_argument("--n-jobs", type=int, default=0, help="processi/thread (default: tutti i core)")
+    ap.add_argument("--n-jobs", type=int, default=0, help="processes/threads (default: all cores)")
     ap.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
     args = ap.parse_args()
     configure(args.n_jobs, args.device)
@@ -163,7 +163,7 @@ def main():
         a, b = (Xf, Xtef) if name == "logreg" else (X, Xte)
         res[name] = cv_model(name, make, a, y, b)
 
-    # ensemble: media delle probabilità, e media dei migliori
+    # Ensemble: average probabilities, including averages of the best models
     names = sorted(res, key=lambda n: -res[n][2])
     best_combo, best_acc = None, 0
     for k in range(1, len(names) + 1):
@@ -175,9 +175,9 @@ def main():
     pte = np.mean([res[n][1] for n in best_combo], axis=0)
     sub = pd.DataFrame({"battle_id": te.battle_id.values, "player_won": (pte > 0.5).astype(int)})
     sub.to_csv(os.path.join(OUT, "submission.csv"), index=False)
-    print(f"submission salvata ({best_combo}, CV {best_acc:.4f}) -> outputs/submission.csv")
+    print(f"submission saved ({best_combo}, CV {best_acc:.4f}) -> outputs/submission.csv")
 
-    # importanza feature (lgbm full fit)
+    # Feature importance from a full LightGBM fit
     m = lgb.LGBMClassifier(**lgb_params).fit(X, y)
     imp = pd.Series(m.booster_.feature_importance("gain"), index=X.columns).sort_values(ascending=False)
     imp.to_csv(os.path.join(OUT, "feature_importance.csv"))

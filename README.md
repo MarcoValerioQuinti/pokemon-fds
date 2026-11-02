@@ -1,5 +1,13 @@
 # Pokémon Gen 2 OU battle outcome prediction
 
+> **Update:** the original pipeline is preserved. Local repeated meta-CV reproduction:
+> **0.69958 ± 0.01009**; the historical **0.6957 nested estimate remains unverified**.
+> Public Kaggle scores supplied by the team: Marco `submission_final.csv` **0.70133**,
+> Marco `submission_stacking_mc_rec.csv` **0.70066**, Luca notebook V1 **0.69466**.
+> Public leaderboard scores and CV are distinct. No further tests or training were run;
+> the report is deferred. The updated notebook clones the repository and runs the original model.
+
+
 Classical machine-learning pipeline (no neural networks) for the Kaggle competition
 FDS Pokémon Battles Prediction 2026:
 given the first 30 turns of a competitive Gen 2 OU battle, predict whether player 1 wins.
@@ -13,7 +21,7 @@ hand-crafted battle-state features plus Monte Carlo and recursive roll-out featu
 | Nested CV of the whole stacking procedure (5 outer × 5 inner folds) | **0.6957** (folds 0.686–0.710) |
 | 95% confidence interval of the OOF accuracy | about ±0.9 points |
 
-All results are local cross-validation estimates; nothing has been tuned on the Kaggle leaderboard.
+The validation results below are local cross-validation estimates; public Kaggle scores are listed separately above. No leaderboard-based tuning was performed during this task.
 
 ---
 
@@ -68,9 +76,9 @@ Facts about the data that shape the whole design:
   - This lets us infer player 2's hidden Pokémon by matching whole teams.
 - **Duplicates.** There are 27 groups of battles with identical timelines, and their labels are
   always consistent.
-  - Cross-validation keeps them in the same fold.
+  - Nested cross-validation keeps them in the same fold; original base OOF is ungrouped.
   - The 7 test battles identical to a training battle receive its label.
-- **No leakage, no shift.**
+- **Historical leakage/shift screens.**
   - `battle_id` has AUC 0.505 for the label.
   - A train-vs-test adversarial classifier reaches AUC 0.501.
   - No feature has a significantly different train/test distribution.
@@ -99,13 +107,13 @@ reports/
   02_report_costi_benefici.ipynb      cost/benefit of every method and model
   build_notebooks.py                  generates both notebooks
 kaggle/
-  pokemon-fds-final.ipynb             self-contained Kaggle notebook: trains the final model, writes submission.csv
-  build_kaggle_notebook.py            builds the notebook from src/ and kernel-metadata.json
+  pokemon-fds-final.ipynb             repository-cloning Kaggle notebook: runs the original final model
+  build_kaggle_notebook.py            builds the repository-cloning notebook
   README.md                           how to submit from the Kaggle website or the Kaggle CLI
 outputs/                   caches, OOF predictions, experiments, submissions (generated)
 ```
 
-The notebooks are written in Italian, and their content is summarized in [section 9](#9-statistical-reports).
+The notebook text is in English; historical plot images retain their original labels. Their content is summarized in [section 9](#9-statistical-reports).
 They are committed with their outputs. Re-running them needs the cached predictions of every
 experiment in `outputs/`, which is not versioned: the OOF folders and the nested experiments
 produced by `stacking.py` and `evaluate_nested.py`.
@@ -129,8 +137,8 @@ python src/final_model.py     # features + 10 base models + meta-learner -> outp
 The data and output folders default to `data/` and `outputs/`. The `POKEMON_DATA` and `POKEMON_OUT`
 environment variables override them; the Kaggle notebook sets both.
 
-**Submitting on Kaggle.** [`kaggle/`](kaggle/README.md) contains a self-contained notebook that runs
-this same pipeline on the competition data and writes `submission.csv`, plus a step-by-step guide
+**Submitting on Kaggle.** [`kaggle/`](kaggle/README.md) contains a repository-cloning notebook that runs
+this same pipeline on the competition data and writes `submission_final.csv`, plus a step-by-step guide
 for the website and the Kaggle CLI.
 
 Other entry points:
@@ -341,7 +349,7 @@ Final 10-model stack against the 22-model stack, on the same battles:
 - **Cost:** 43% less training time.
 - **Predictions:** the two submissions agree on 98.7% of the test battles.
 
-**Unbiased estimate.** The 10 models were chosen by looking at the same OOF predictions, so
+**Historical nested estimate (not reverified).** The 10 models were chosen by looking at the same OOF predictions, so
 0.6994 is slightly optimistic. The nested CV of the full final procedure gives **0.6957**.
 
 Against the nested 4-model baseline (logreg, LightGBM, XGBoost, CatBoost: 0.6911):

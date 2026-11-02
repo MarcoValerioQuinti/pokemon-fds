@@ -1,190 +1,136 @@
-"""Builds the self-contained Kaggle notebook that trains the final model and writes submission.csv.
-
-The notebook embeds the source of the modules it needs (taken from src/ at build time, so it never
-drifts from the repository), runs the pipeline on the competition data and writes
-/kaggle/working/submission.csv. It also writes kernel-metadata.json for `kaggle kernels push`.
-
-Usage:
-    python kaggle/build_kaggle_notebook.py --user <kaggle-username>
-"""
+"""Build a repository-cloning notebook for the unchanged original final model."""
 import argparse
 import json
-import os
+from pathlib import Path
+import re
 
-import nbformat as nbf
+HERE = Path(__file__).resolve().parent
+REPOSITORY = 'https://github.com/MarcoValerioQuinti/pokemon-fds.git'
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "..", "src")
-COMPETITION = "fds-pokemon-battles-prediction-2026"
-SLUG = "pokemon-fds-final"
-TITLE = "Pokemon FDS Final"  # Kaggle derives the slug from the title: it must match SLUG
-NOTEBOOK = f"{SLUG}.ipynb"
 
-# module -> one-line description, in dependency order
-MODULES = {
-    "compute.py": "Hardware configuration: cores, CUDA, fork/spawn, fold-level parallelism.",
-    "features.py": "Battle-state feature engineering, Gen 2 damage engine, label-free context (pokédex, "
-                   "Hidden Power types, co-occurrence, species moves).",
-    "train.py": "Feature cache (turn 30 + training snapshots at turns 20-28) and bag-of-words columns.",
-    "simulate.py": "Monte Carlo simulator: plays every battle to the end 100 times from the last observed state.",
-    "recursive.py": "Recursive model: LightGBM turn-to-turn transition model and roll-outs (RNN-like, no neural nets).",
-    "stacking.py": "Base model zoo, out-of-fold predictions with snapshot augmentation, duplicate override.",
-    "final_model.py": "Final 10-model stack with a logistic-regression meta-learner.",
-}
+def build(commit='', repository=REPOSITORY):
+    if commit and not re.fullmatch(r'[0-9a-fA-F]{40}', commit):
+        raise ValueError('Use a full 40-character Git commit SHA')
+    cells = []
 
-INTRO = """# FDS Challenge: Pokémon Battle Prediction — final model
+    def add(kind, source):
+        cell = {'cell_type': kind, 'id': f'cell-{len(cells):02d}', 'metadata': {},
+                'source': source.splitlines(keepends=True)}
+        if kind == 'code':
+            cell.update(execution_count=None, outputs=[])
+        cells.append(cell)
 
-Classical machine learning only (no neural networks). Given the first 30 turns of a Gen 2 OU battle,
-the notebook predicts whether player 1 wins.
+    add('markdown', '''# Pokémon FDS — original final model
 
-**Pipeline**
+This notebook clones the repository and executes the original Monte Carlo, recursive
+features and ten-model stacking pipeline. Model source, features, hyperparameters and
+seeds are preserved. No project modules are embedded in cells.
 
-1. **Features:** about 280 battle-state features from a Gen 2 damage engine, plus bag-of-words of
-   Pokémon and moves.
-2. **Monte Carlo features:** 100 simulated continuations of every battle.
-3. **Recursive features:** turn-by-turn roll-outs of a gradient-boosted transition model.
-4. **Snapshot augmentation:** training battles truncated at turns 24/26/28 are added inside the
-   training folds, with weight 0.5.
-5. **Stack of 10 diverse base models:** LightGBM, XGBoost and CatBoost with augmentation,
-   ExtraTrees, Random Forest, LDA and two logistic regressions. A logistic-regression meta-learner
-   combines their out-of-fold logits.
+Completed local reproduction: repeated meta-CV accuracy **0.69958**, fold-score SD
+**0.01009**. The historical **0.6957** whole-stack nested estimate remains unverified.
+These are different evaluation protocols.
 
-**Expected accuracy:** about 0.696 in nested cross-validation (0.699 with plain 5-fold OOF).
+Public scores supplied by the team (not independently retrieved):
+- Marco, `submission_final.csv`: **0.70133**.
+- Marco, `submission_stacking_mc_rec.csv`: **0.70066**.
+- Luca, notebook Version 1: **0.69466**.
 
-**Settings:**
-- Accelerator: **None**. The CPU run takes about 30–40 minutes on Kaggle's 4 cores. With a GPU,
-  XGBoost and CatBoost switch to CUDA and the predictions change slightly.
-- Internet: not needed.
+This notebook reproduces the original final configuration only. Exact reconstruction
+of the other two entries requires their original configurations/code; they are not
+replaced with newly invented alternatives. No claim is made that the local regenerated
+CSV is byte-identical to Marco's uploaded file.
 
-Source code and full documentation: https://github.com/MarcoValerioQuinti/pokemon-fds"""
-
-SETUP = '''import glob
-import os
+CPU; Internet enabled for Git and dependency installation. Attach the four official
+files after accepting the rules. If Internet is prohibited, clarify the cloning
+requirement with the organizers. Check mechanics provenance and team-sharing eligibility
+in `COMPLIANCE.md`; a public score does not certify rule compliance.
+''')
+    add('code', f'''import os
+from pathlib import Path
+REPO_URL = os.environ.get("POKEMON_REPO_URL", {repository!r})
+REPO_COMMIT = os.environ.get("POKEMON_COMMIT", {commit!r})
+DATA_DIR = os.environ.get("POKEMON_DATA", "")
+REPO = Path("/kaggle/working/pokemon-fds")
+OUT = Path("/kaggle/working/original-model")
+N_JOBS = 2
+''')
+    add('code', '''import re
 import subprocess
 import sys
-import time
+assert re.fullmatch(r"[0-9a-fA-F]{40}", REPO_COMMIT), "Set a full published Git SHA containing this workflow"
+if not REPO.exists():
+    subprocess.run(["git", "clone", "--no-checkout", REPO_URL, str(REPO)], check=True)
+else:
+    assert subprocess.check_output(["git", "-C", str(REPO), "remote", "get-url", "origin"], text=True).strip() == REPO_URL
+    assert not subprocess.check_output(["git", "-C", str(REPO), "status", "--porcelain"], text=True).strip(), "Checkout has local changes"
+subprocess.run(["git", "-C", str(REPO), "fetch", "origin", REPO_COMMIT], check=True)
+subprocess.run(["git", "-C", str(REPO), "checkout", "--detach", REPO_COMMIT], check=True)
+assert subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip().lower() == REPO_COMMIT.lower()
+assert (REPO / "src/final_model.py").is_file()
+subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(REPO / "requirements-final.txt")], check=True)
+''')
+    add('code', '''required = ("train.jsonl", "test.jsonl", "type_chart_gen2.csv", "sample_submission.csv")
+if DATA_DIR:
+    DATA = Path(DATA_DIR)
+else:
+    matches = sorted({p.parent for p in Path("/kaggle/input").rglob("train.jsonl")
+                      if all((p.parent / name).is_file() for name in required)})
+    assert len(matches) == 1, f"Set DATA_DIR explicitly; matching folders: {matches}"
+    DATA = matches[0]
+assert all((DATA / name).is_file() for name in required)
+assert not OUT.exists(), "Use a fresh output directory; original caches have no fingerprints"
+OUT.mkdir(parents=True)
+env = dict(os.environ, POKEMON_DATA=str(DATA), POKEMON_OUT=str(OUT),
+           POKEMON_DEVICE="cpu", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
+''')
+    add('markdown', '''## Original simulation and recursive features
 
-import pandas as pd
+Run the original modules with their defaults: 100 Monte Carlo simulations, 30 recursive
+rollouts, original training snapshots and seed policies. All computation runs in fresh
+Python subprocesses using the pinned repository. No additional nested evaluation is run.
+''')
+    add('code', '''for module in ("simulate.py", "recursive.py"):
+    subprocess.run([sys.executable, str(REPO / "src" / module), "--n-jobs", str(N_JOBS)],
+                   cwd=REPO, env=env, check=True)
+''')
+    add('markdown', '''## Submission — original ten-model stack
 
+The original final model combines augmented LightGBM/XGBoost/CatBoost, dense boosted
+variants, ExtraTrees, Random Forest, LDA and logistic models. A logistic meta-learner
+fits base OOF logits. This is Marco's final-model configuration, associated with the
+team-reported public score 0.70133; that score does not describe this unexecuted Kaggle
+rerun. The original module also prints repeated meta-CV diagnostics and retains its
+seven-match duplicate-label policy. Rule questions remain documented.
+''')
+    add('code', '''subprocess.run([sys.executable, str(REPO / "src/final_model.py"),
+                "--n-jobs", str(N_JOBS), "--device", "cpu", "--out", "submission_final.csv"],
+               cwd=REPO, env=env, check=True)
+import shutil
+submission = Path("/kaggle/working/submission_final.csv")
+shutil.copy2(OUT / "submission_final.csv", submission)
+print(submission)
+''')
+    add('markdown', '''## Remaining delivery
 
-def find_data_dir():
-    """Competition data: mounted under /kaggle/input on Kaggle, POKEMON_DATA or ./data elsewhere."""
-    hits = sorted(glob.glob("/kaggle/input/**/train.jsonl", recursive=True))
-    if hits:
-        return os.path.dirname(hits[0])
-    return os.environ.get("POKEMON_DATA", os.path.abspath("data"))
+This creates one original-model CSV, not three selected Kaggle entries. Recover the
+exact configurations for `submission_stacking_mc_rec.csv` and Luca's Version 1 before
+claiming all three can be reproduced here. No replacement candidates are fabricated.
 
-
-DATA_DIR = find_data_dir()
-OUT_DIR = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.getcwd()
-WORK_DIR = os.path.join(OUT_DIR, "outputs")  # feature caches, simulations, out-of-fold predictions
-os.environ.update(POKEMON_DATA=DATA_DIR, POKEMON_OUT=WORK_DIR)
-os.makedirs("src", exist_ok=True)
-
-import catboost, lightgbm, sklearn, xgboost
-print(f"data: {DATA_DIR} -> {sorted(os.listdir(DATA_DIR))}")
-print(f"outputs: {WORK_DIR}; cores: {os.cpu_count()}")
-print(f"scikit-learn {sklearn.__version__}, lightgbm {lightgbm.__version__}, "
-      f"xgboost {xgboost.__version__}, catboost {catboost.__version__}")'''
-
-RUN_HELPER = '''def run(script, *args):
-    """Runs src/<script> in a subprocess, streams its log and stops the notebook if it fails."""
-    t0 = time.time()
-    proc = subprocess.Popen([sys.executable, "-u", f"src/{script}", *args], stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
-    for line in proc.stdout:
-        if "Warning" not in line and "warnings.warn" not in line:  # hide library warnings
-            print(line, end="")
-    if proc.wait():
-        raise RuntimeError(f"{script} failed with exit code {proc.returncode}")
-    print(f"--- {script}: {(time.time() - t0) / 60:.1f} min")'''
-
-SUBMISSION = '''pred = pd.read_csv(os.path.join(WORK_DIR, "submission_final.csv"))
-sample = pd.read_csv(os.path.join(DATA_DIR, "sample_submission.csv"))
-submission = sample[["battle_id"]].merge(pred, on="battle_id", how="left")
-assert len(submission) == len(sample) and submission["player_won"].notna().all()
-submission["player_won"] = submission["player_won"].astype(int)
-submission.to_csv(os.path.join(OUT_DIR, "submission.csv"), index=False)
-print(f"submission.csv written: {len(submission)} rows, share predicted as player 1 win: "
-      f"{submission['player_won'].mean():.3f}")
-submission.head()'''
-
-SUBMIT_MD = f"""### 4. Submitting
-
-**From the Kaggle website**
-
-1. Click **Save Version** → **Save & Run All (Commit)**.
-2. When the run finishes, open the notebook viewer.
-3. Under **Output**, use **Submit to Competition**. This submits `submission.csv`.
-
-**From the command line** (Kaggle CLI, after `kaggle kernels push` has run this notebook)
-
-```bash
-kaggle kernels status <user>/{SLUG}
-kaggle competitions submit {COMPETITION} -k <user>/{SLUG} -f submission.csv -v <version> -m "final 10-model stack"
-kaggle competitions submissions {COMPETITION}
-```"""
-
-
-def notebook():
-    md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
-    cells = [md(INTRO), md("### 0. Setup"), code(SETUP),
-             md("### 1. Source code\n\nEach cell writes one module to `src/`. The modules are copied "
-                "verbatim from the repository; comments are in Italian.")]
-    for name, desc in MODULES.items():
-        with open(os.path.join(SRC, name), encoding="utf-8") as f:
-            source = f.read().rstrip("\n")
-        cells += [md(f"**`src/{name}`**: {desc}"), code(f"%%writefile src/{name}\n{source}")]
-    cells += [
-        md("### 2. Pipeline\n\nEvery step caches its results in `outputs/`."),
-        code(RUN_HELPER),
-        md("**Monte Carlo features.** 15,000 battles + 30,000 training snapshots × 100 simulations."),
-        code('run("simulate.py", "--n-sims", "100")'),
-        md("**Recursive roll-out features.**"),
-        code('run("recursive.py")'),
-        md("**Features, out-of-fold predictions of the 10 base models, meta-learner.** The battle-state "
-           "features are built here on first use. The log shows each model's out-of-fold accuracy "
-           "and the cross-validated accuracy of the meta-learner."),
-        code('run("final_model.py", "--out", "submission_final.csv")'),
-        md("### 3. Submission file"),
-        code(SUBMISSION),
-        md(SUBMIT_MD),
-    ]
-    nb = nbf.v4.new_notebook()
-    nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
-    nb.cells = cells
-    return nb
+No upload or selection is performed. Per the task, select three entries before
+November 5, 2026, 23:59 (confirm official timezone), at most three uploads daily.
+Make the notebook public after the competition and submit notebook/report by
+November 12, 2026. The report is deferred. This revised notebook has not been run on Kaggle.
+''')
+    notebook = {'cells': cells, 'metadata': {'kernelspec': {'display_name': 'Python 3',
+                'language': 'python', 'name': 'python3'}, 'language_info': {'name': 'python'}},
+                'nbformat': 4, 'nbformat_minor': 5}
+    (HERE / 'pokemon-fds-final.ipynb').write_text(json.dumps(notebook, indent=1) + '\n')
+    return notebook
 
 
-def metadata(user):
-    return {
-        "id": f"{user}/{SLUG}",
-        "title": TITLE,
-        "code_file": NOTEBOOK,
-        "language": "python",
-        "kernel_type": "notebook",
-        "is_private": True,
-        "enable_gpu": False,
-        "enable_tpu": False,
-        "enable_internet": False,
-        "dataset_sources": [],
-        "competition_sources": [COMPETITION],
-        "kernel_sources": [],
-        "model_sources": [],
-    }
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--user", default=os.environ.get("KAGGLE_USERNAME", "YOUR_KAGGLE_USERNAME"),
-                    help="Kaggle username (owner of the notebook)")
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--commit', default='')
+    ap.add_argument('--repository', default=REPOSITORY)
     args = ap.parse_args()
-    nbf.write(notebook(), os.path.join(HERE, NOTEBOOK))
-    with open(os.path.join(HERE, "kernel-metadata.json"), "w") as f:
-        json.dump(metadata(args.user), f, indent=2)
-        f.write("\n")
-    print(f"written kaggle/{NOTEBOOK} and kaggle/kernel-metadata.json (id {args.user}/{SLUG})")
-
-
-if __name__ == "__main__":
-    main()
+    build(args.commit, args.repository)

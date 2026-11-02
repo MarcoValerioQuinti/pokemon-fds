@@ -1,11 +1,11 @@
-"""Pseudo Monte Carlo: simula il resto della battaglia a partire dal turno 30.
+"""Pseudo Monte Carlo simulation of the battle after turn 30.
 
-Riusa il motore di danno di features.py (stats Gen 2, mosse rivelate, tipo di hiddenpower
-inferito) e campiona le incertezze: pokemon di p2 non visti (dalle co-occorrenze),
-random roll, crit, miss, durata del sonno, paralisi, scongelamento. Ogni battaglia viene
-giocata fino alla fine N volte; le statistiche delle simulazioni diventano feature per lo stacking.
+Reuse the features.py damage engine (Gen 2 stats, revealed moves, inferred Hidden Power
+ type) and sample uncertainties: unseen p2 Pokemon from co-occurrence, damage rolls,
+critical hits, misses, sleep duration, paralysis and thawing. Play each battle to the
+end N times; simulation statistics become stacking features.
 
-Uso: python src/simulate.py [--n-sims 40]  ->  outputs/mc_features.pkl
+Usage: python src/simulate.py [--n-sims 40] -> outputs/mc_features.pkl
 """
 import argparse
 import os
@@ -22,13 +22,13 @@ from features import (HEAL_MOVES, FIXED_DAMAGE, build_cooccurrence, build_pokede
                       damage_frac, infer_hp_types, load_jsonl, load_type_chart, stab_moves)
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-DATA = os.environ.get("POKEMON_DATA", os.path.join(ROOT, "data"))  # su Kaggle: /kaggle/input/...
+DATA = os.environ.get("POKEMON_DATA", os.path.join(ROOT, "data"))  # On Kaggle: /kaggle/input/...
 OUT = os.environ.get("POKEMON_OUT", os.path.join(ROOT, "outputs"))
 MAX_TURNS = 250
 SNAP_TURNS = (24, 26, 28)
 CRIT = 0.066
 
-_G = {}  # stato globale dei worker (dex, chart, ...)
+_G = {}  # Global worker state (dex, chart, etc.)
 
 
 def _prep(battles):
@@ -36,8 +36,8 @@ def _prep(battles):
 
 
 def build_globals(clean=False):
-    """Dati condivisi dalle simulazioni, calcolati una volta nel processo padre.
-    clean=True: timeline con le sole mosse realmente eseguite (spikes, rest, mosse note)."""
+    """Shared simulation data, computed once in the parent process.
+    clean=True keeps only actually executed moves (spikes, rest and known moves)."""
     _G["clean"] = clean
     battles = _prep(load_jsonl(os.path.join(DATA, "train.jsonl")) + load_jsonl(os.path.join(DATA, "test.jsonl")))
     chart = load_type_chart(os.path.join(DATA, "type_chart_gen2.csv"))
@@ -47,7 +47,7 @@ def build_globals(clean=False):
 
 
 def _set_globals(g):
-    """Initializer dei worker: con spawn (Windows) i dati arrivano da qui, con fork sono già ereditati."""
+    """Worker initializer: spawn receives data here; fork has already inherited it."""
     _G.update(g)
 
 
@@ -56,7 +56,7 @@ def boost_mult(stage):
 
 
 def parse_state(b):
-    """Stato noto al turno 30: per ogni pokemon hp, status, mosse note, info sul sonno."""
+    """Known state at turn 30: HP, status, known moves and sleep information per Pokemon."""
     tl = b["battle_timeline"]
     side = {"p1": {}, "p2": {}}
     for p in b["p1_team_details"]:
@@ -89,13 +89,13 @@ def parse_state(b):
 
 
 class Battle:
-    """Una singola simulazione. I pokemon sono indicizzati 0..n-1 per lato."""
+    """One simulation. Pokemon are indexed 0..n-1 on each side."""
 
     def __init__(self, b, side, active, boosts, spikes, rng):
         dex, chart, hp_types = _G["dex"], _G["chart"], _G["hp_types"]
         self.rng = rng
         mons = {s: {n: dict(v) for n, v in side[s].items() if n in dex} for s in ("p1", "p2")}
-        # completa il team di p2 campionando i non visti dalle co-occorrenze
+        # Complete p2 by sampling unseen Pokemon from co-occurrence.
         n_missing = 6 - len(side["p2"])
         if n_missing > 0:
             probs = {}
@@ -103,7 +103,7 @@ class Battle:
                 for c, p in _G["cooc"].get(a, {}).items():
                     if c not in side["p2"] and c in dex:
                         probs[c] = probs.get(c, 0) + p
-            cands = sorted(probs)  # ordine indipendente dall'hash randomizzato
+            cands = sorted(probs)  # Ordering independent of randomized hashes
             w = np.array([probs[c] for c in cands])
             if len(cands):
                 for c in rng_np_choice(rng, cands, w, min(n_missing, len(cands))):
@@ -119,7 +119,7 @@ class Battle:
         self.heal = {s: [next((m for m in mons[s][n]["moves"] if m in HEAL_MOVES), None) for n in self.names[s]]
                      for s in ("p1", "p2")}
         self.spikes = dict(spikes)
-        # turni di sonno rimanenti (now = ultimo turno osservato, 30 o lo snapshot)
+        # Remaining sleep turns (now = final observation turn, 30 or the snapshot turn)
         now = b["battle_timeline"][-1]["turn"]
         self.sleep = {}
         for s in ("p1", "p2"):
@@ -134,7 +134,7 @@ class Battle:
                     slept = now - (m["slp_since"] or now)
                     rem.append(rng.randint(1, max(1, 7 - slept)))
             self.sleep[s] = rem
-        # matrici di danno: (danno grezzo frazionale, accuratezza) della mossa migliore
+        # Best-move damage matrices: (raw fractional damage, accuracy)
         self.dmg = {}
         for s, o in (("p1", "p2"), ("p2", "p1")):
             M = []
@@ -142,8 +142,8 @@ class Battle:
                 ma = mons[s][a]
                 mv = [m for m in ma["moves"].values() if m["category"] != "status" or m["name"] in FIXED_DAMAGE]
                 if not mv:
-                    # STAB generico: le mosse più usate dalla specie (build_species_moves) peggiorano
-                    # l'AUC di mc_hp_diff da 0.693 a 0.684
+                    # Generic STAB: common species moves (build_species_moves) reduce
+                    # mc_hp_diff AUC from 0.693 to 0.684.
                     mv = stab_moves(dex, a)
                 row = []
                 for d in self.names[o]:
@@ -171,7 +171,7 @@ class Battle:
         return sp * 0.25 if self.status[s][i] == "par" else sp
 
     def matchup(self, s, o, i):
-        """Punteggio del pokemon i di s contro l'attivo avversario."""
+        """Score Pokemon i on side s against the opposing active Pokemon."""
         j = self.active[o]
         mine = self.dmg[s][i][j][0] * self.dmg[s][i][j][1]
         theirs = self.dmg[o][j][i][0] * self.dmg[o][j][i][1]
@@ -206,9 +206,9 @@ class Battle:
         return True
 
     def act(self, s, o):
-        """Azione del lato s: switch volontario, cura o attacco."""
+        """Choose an action for side s: voluntary switch, healing or attack."""
         i, j = self.active[s], self.active[o]
-        # switch volontario se il matchup è pessimo ed esiste un'alternativa nettamente migliore
+        # Voluntarily switch out of a poor matchup when a clearly better option exists.
         if self.matchup(s, o, i) < -2.0:
             alts = [k for k in self.alive(s) if k != i]
             if alts:
@@ -275,7 +275,7 @@ class Battle:
 
 
 def rng_np_choice(rng, items, w, k):
-    """Campionamento senza reinserimento pesato, usando random.Random (riproducibile)."""
+    """Reproducible weighted sampling without replacement using random.Random."""
     items, w = list(items), list(w)
     out = []
     for _ in range(k):
@@ -304,10 +304,10 @@ def simulate_battle(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n-sims", type=int, default=100)  # valore usato per le feature dello stack finale
-    ap.add_argument("--limit", type=int, default=0, help="solo le prime N battaglie di train (debug)")
-    ap.add_argument("--clean", action="store_true", help="usa le timeline pulite dalle mosse persistenti")
-    ap.add_argument("--n-jobs", type=int, default=0, help="processi paralleli (default: tutti i core)")
+    ap.add_argument("--n-sims", type=int, default=100)  # Value used for the final stack features
+    ap.add_argument("--limit", type=int, default=0, help="only the first N training battles (debug)")
+    ap.add_argument("--clean", action="store_true", help="use timelines with persistent moves removed")
+    ap.add_argument("--n-jobs", type=int, default=0, help="parallel processes (default: all cores)")
     args = ap.parse_args()
     configure(args.n_jobs)
     print(describe())
@@ -316,7 +316,7 @@ def main():
     for b in test:
         b["player_won"] = -1
     battles = train[:args.limit] if args.limit else train + test
-    # snapshot dei battle di train per l'augmentation dello stacking (stessi turni di stacking.AUG_TURNS)
+    # Training snapshots for stacking augmentation (same turns as stacking.AUG_TURNS)
     snaps = [] if args.limit else [{**b, "battle_timeline": b["battle_timeline"][:t]} for t in SNAP_TURNS for b in train]
     snap_turn = [30] * len(battles) + [len(b["battle_timeline"]) for b in snaps]
     battles = battles + snaps
@@ -329,8 +329,8 @@ def main():
     df.insert(2, "snap_turn", snap_turn)
     y = np.array([b["player_won"] for b in battles])
     trm = (df.is_test.values == 0) & (df.snap_turn.values == 30)
-    print(f"{len(df)} battaglie, {args.n_sims} sim ciascuna, {time.time() - t0:.0f}s")
-    print(f"accuracy di mc_win > 0.5 sul train: {((df.mc_win.values[trm] > 0.5) == y[trm]).mean():.4f}")
+    print(f"{len(df)} battles, {args.n_sims} simulations each, {time.time() - t0:.0f}s")
+    print(f"mc_win accuracy > 0.5 sul train: {((df.mc_win.values[trm] > 0.5) == y[trm]).mean():.4f}")
     print(df[trm].describe().T[["mean", "std"]])
     if not args.limit:
         os.makedirs(OUT, exist_ok=True)

@@ -1,0 +1,12 @@
+# CPU reference environment, Python 3.11-3.13. Exact direct dependencies.
+numpy==2.2.6
+pandas==2.2.3
+scipy==1.15.3
+scikit-learn==1.6.1
+lightgbm==4.6.0
+xgboost==3.0.2
+catboost==1.2.8
+joblib==1.5.1
+pytest==8.3.5
+nbformat==5.10.4
+threadpoolctl==3.7.0
