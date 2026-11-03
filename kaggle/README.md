@@ -32,7 +32,8 @@ The run takes about 1 hour on Kaggle's CPU (4 cores).
    choose `kaggle/pokemon-fds-final.ipynb`.
 2. In the right panel:
    - **Input:** the competition data must be attached;
-   - **Accelerator:** None;
+   - **Accelerator:** None. The notebook pins the CPU (`DEVICE = "cpu"`), so a GPU would only cost
+     quota without changing the results; a TPU is not used by any of the libraries;
    - **Internet:** on.
 3. **Save Version** → **Save & Run All (Commit)**.
 4. When the run finishes, open the notebook viewer and, under **Output**, submit each of the three

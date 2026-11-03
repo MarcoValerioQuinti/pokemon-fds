@@ -73,8 +73,11 @@ regenerates our **3 selected final submissions**.
 bag-of-words vocabulary, the Monte Carlo context and the transition model are fitted on the training
 battles only; the test battles are only transformed.
 
-**Settings:** Accelerator **None** (CPU; about 1 hour on Kaggle's 4 cores). Internet **on**, needed to
-clone the repository."""
+**Settings:**
+- Accelerator **None**: about 1 hour on Kaggle's 4 CPU cores. The run is pinned to the CPU (`DEVICE`
+  below), so the selected accelerator never changes the predictions. A GPU would only speed up
+  XGBoost and CatBoost, with slightly different results; a TPU is not used by any of these libraries.
+- Internet **on**, needed to clone the repository."""
 
 SETUP = '''import glob
 import os
@@ -86,6 +89,7 @@ import pandas as pd
 
 REPO = "{repo}"
 COMMIT = "{commit}"  # exact version of the code that produced the selected submissions
+DEVICE = "cpu"  # "cpu" reproduces the selected submissions; "auto" uses an NVIDIA GPU for XGBoost/CatBoost
 
 
 def find_data_dir():
@@ -103,12 +107,12 @@ WORK_DIR = os.path.join(OUT_DIR, "outputs")  # feature caches, simulations, out-
 if not os.path.isdir(CODE_DIR):
     subprocess.run(["git", "clone", "--quiet", REPO, CODE_DIR], check=True)
 subprocess.run(["git", "-C", CODE_DIR, "checkout", "--quiet", COMMIT], check=True)
-os.environ.update(POKEMON_DATA=DATA_DIR, POKEMON_OUT=WORK_DIR)
+os.environ.update(POKEMON_DATA=DATA_DIR, POKEMON_OUT=WORK_DIR, POKEMON_DEVICE=DEVICE)
 
 import catboost, lightgbm, numpy, sklearn, xgboost
 print("code:", subprocess.run(["git", "-C", CODE_DIR, "log", "-1", "--format=%h %s"], capture_output=True, text=True).stdout.strip())
 print(f"data: {{DATA_DIR}} -> {{sorted(os.listdir(DATA_DIR))}}")
-print(f"cores: {{os.cpu_count()}}; numpy {{numpy.__version__}}, scikit-learn {{sklearn.__version__}}, "
+print(f"device: {{DEVICE}}; cores: {{os.cpu_count()}}; numpy {{numpy.__version__}}, scikit-learn {{sklearn.__version__}}, "
       f"lightgbm {{lightgbm.__version__}}, xgboost {{xgboost.__version__}}, catboost {{catboost.__version__}}")'''
 
 RUN_HELPER = '''def run(script, *args):
