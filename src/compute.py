@@ -1,15 +1,14 @@
-"""Configurazione hardware portabile (macOS / Linux / Windows).
+"""Portable hardware configuration (macOS / Linux / Windows).
 
-Tutto è sovrascrivibile da variabili d'ambiente o dalle opzioni --n-jobs / --device degli script:
-    POKEMON_N_JOBS   numero di processi/thread (default: tutti i core)
-    POKEMON_DEVICE   auto | cpu | cuda (default: auto -> cuda se c'è una GPU NVIDIA)
-    POKEMON_MP       fork | spawn (default: fork dove esiste, spawn su Windows)
+Everything can be overridden by environment variables or by the --n-jobs / --device options:
+    POKEMON_N_JOBS   number of processes/threads (default: all cores)
+    POKEMON_DEVICE   auto | cpu | cuda (default: auto -> cuda when an NVIDIA GPU is found)
+    POKEMON_MP       fork | spawn (default: fork where available, spawn on Windows)
 
-- Multiprocessing: `fork` su Linux/macOS (i worker ereditano i dati del padre), `spawn` su
-  Windows (dove `fork` non esiste); i dati passano dall'initializer, quindi funziona con entrambi.
-- GPU: XGBoost (`device="cuda"`) e CatBoost (`task_type="GPU"`) solo con CUDA (Linux/Windows
-  con NVIDIA). Su Mac Apple Silicon non c'è backend GPU per questi modelli: si usa la CPU.
-- LightGBM resta su CPU (la build GPU non è quella standard di pip/conda).
+- Multiprocessing: workers receive their data through the pool initializer, so the code works both
+  with `fork` (Linux/macOS) and `spawn` (Windows). With one job everything runs in-process.
+- GPU: XGBoost (`device="cuda"`) and CatBoost (`task_type="GPU"`) with CUDA only. These libraries have
+  no Apple GPU backend, so on Apple Silicon they run on the CPU. LightGBM always runs on the CPU.
 """
 import multiprocessing as mp
 import os
@@ -25,7 +24,7 @@ def n_jobs():
 
 
 def mp_context():
-    forced = os.environ.get("POKEMON_MP")  # fork | spawn, per testare il percorso Windows altrove
+    forced = os.environ.get("POKEMON_MP")  # fork | spawn, e.g. to test the Windows path elsewhere
     if forced:
         return mp.get_context(forced)
     methods = mp.get_all_start_methods()
@@ -50,7 +49,7 @@ def device():
 
 
 def configure(n=None, dev=None):
-    """Applica le opzioni da riga di comando (prima di creare modelli o pool)."""
+    """Applies the command-line options (before creating models or pools)."""
     global _DEVICE
     if n:
         os.environ["POKEMON_N_JOBS"] = str(n)
@@ -68,7 +67,7 @@ def catboost_params():
 
 
 def pool_map(func, items, initializer=None, initargs=(), chunksize=50):
-    """map parallelo portabile; con un solo job gira nel processo corrente."""
+    """Portable parallel map; with a single job it runs in the current process."""
     if n_jobs() == 1:
         if initializer:
             initializer(*initargs)
@@ -77,33 +76,33 @@ def pool_map(func, items, initializer=None, initargs=(), chunksize=50):
         return pool.map(func, items, chunksize=chunksize)
 
 
-# Fold allenati in parallelo per famiglia di modelli; i thread di ciascuno sono n_jobs // worker.
-# Misurato sul M5 (4 core P + 6 core E) con 10k righe: i boosting scalano male oltre ~3 thread
-# (lgbm/xgb 1.5x più veloci con 3 worker x 3 thread che con 1 x 10, catboost 1.1x con 2 x 5);
-# ExtraTrees/RF di sklearn scalano bene sui thread e restano 1 worker x tutti i thread.
+# Folds trained in parallel per model family, each with n_jobs // workers threads. Measured on an
+# Apple M5 (4 performance + 6 efficiency cores) with 10k rows: boosting scales poorly beyond ~3
+# threads (LightGBM/XGBoost 1.5x faster with 3 workers x 3 threads than 1 x 10, CatBoost 1.1x with
+# 2 x 5), while scikit-learn's ExtraTrees/RF scale well with threads and keep 1 worker.
 FOLD_WORKERS = {"lgbm": 3, "xgb": 3, "catboost": 2}
 
 
 def fold_plan(model, single_thread=False):
-    """(worker, thread per worker) per allenare i fold di `model`. single_thread: modelli a un
-    thread (logreg, svm, ...), un fold per core."""
+    """(workers, threads per worker) used to train the folds of `model`. single_thread: models that
+    use one thread (logistic regression, SVM, ...), one fold per core."""
     total = n_jobs()
     if single_thread:
         return total, 1
     family = model.split("_")[0]
     if device() == "cuda" and family in ("xgb", "catboost"):
-        return 1, total  # una sola GPU: i fold restano sequenziali
+        return 1, total  # a single GPU: folds stay sequential
     workers = min(FOLD_WORKERS.get(family, 1), total)
     return workers, max(1, total // workers)
 
 
 def _with_threads(threads, fn, args):
-    os.environ["POKEMON_N_JOBS"] = str(threads)  # letto dalle factory dei modelli nel worker
+    os.environ["POKEMON_N_JOBS"] = str(threads)  # read by the model factories inside the worker
     return fn(*args)
 
 
 def fold_map(fn, arg_list, workers, threads):
-    """[fn(*a) for a in arg_list], con `workers` processi (joblib/loky, portabile) da `threads` thread."""
+    """[fn(*a) for a in arg_list] with `workers` processes (joblib/loky, portable) of `threads` threads."""
     if workers <= 1:
         return [fn(*a) for a in arg_list]
     from joblib import Parallel, delayed

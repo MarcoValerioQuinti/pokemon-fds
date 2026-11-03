@@ -1,18 +1,17 @@
-"""Valutazione annidata (nested CV) dell'intera pipeline di stacking.
+"""Nested cross-validation of the whole stacking procedure.
 
-Per ogni fold esterno (5, stratificato, seed 42):
-  1. i fold interni (5) sul solo training esterno danno le OOF interne dei base model;
-  2. il meta-modello (scelto a priori: logreg sui logit) si allena su quelle OOF;
-  3. i base model, riaddestrati su tutto il training esterno, predicono il fold esterno;
-  4. il meta combina queste predizioni: una sola predizione esterna per battaglia.
-Le etichette del fold esterno non toccano né i base model, né il meta, né la soglia (0.5).
+For each outer fold (5, stratified, seed 42):
+  1. inner 5-fold OOF predictions of the base models on the outer training part only;
+  2. a logistic-regression meta-learner (chosen beforehand) fitted on those inner OOF predictions;
+  3. the base models refitted on the whole outer training part predict the outer fold;
+  4. the meta-learner combines them: one outer prediction per battle.
+The outer-fold labels never touch the base models, the meta-learner or the threshold (0.5).
+Battles with identical timelines always end up in the same fold, outer and inner.
 
-I duplicati esatti (stessa timeline) finiscono sempre nello stesso fold, sia esterno sia interno.
-
-Uso:
-    python src/evaluate_nested.py --name base4 --models logreg,lgbm,xgb,catboost --extra mc,rec
-    python src/evaluate_nested.py --compare base4 altro   # differenza appaiata + bootstrap
-Output in outputs/experiments/<name>/: predictions.csv, metrics.json, config.json.
+Usage:
+    python src/evaluate_nested.py --name final --models lgbm_aug,xgb_aug,...
+    python src/evaluate_nested.py --compare A B   # paired accuracy difference with bootstrap CI
+Outputs in outputs/experiments/<name>/: predictions.csv, metrics.json, config.json.
 """
 import argparse
 import hashlib
@@ -30,17 +29,16 @@ from sklearn.model_selection import StratifiedKFold
 
 sys.path.insert(0, os.path.dirname(__file__))
 from compute import configure, describe, fold_map, fold_plan
+from dataset import DATA, OUT, SEED
 from features import load_jsonl
-import stacking
-from stacking import MODELS, PARALLEL_FOLDS, REGIMES, get_snap, get_X, load_data
-from train import DATA, OUT, SEED
+from stacking import PARALLEL_FOLDS, fit_model, get_X, load_data, MODELS
 
 EXP = os.path.join(OUT, "experiments")
 N_OUTER = N_INNER = 5
 
 
 def duplicate_groups(battles):
-    """Gruppo per battaglia: battaglie con timeline identica condividono il gruppo."""
+    """Group id per battle: battles with an identical timeline share the group."""
     first = {}
     groups = []
     for i, b in enumerate(battles):
@@ -50,7 +48,7 @@ def duplicate_groups(battles):
 
 
 def make_folds(y, groups, n, seed):
-    """StratifiedKFold standard; poi i duplicati seguono il fold del primo del gruppo."""
+    """Standard StratifiedKFold; then duplicates follow the fold of the first battle of their group."""
     fold = np.empty(len(y), int)
     for k, (_, va) in enumerate(StratifiedKFold(n, shuffle=True, random_state=seed).split(np.zeros(len(y)), y)):
         fold[va] = k
@@ -61,26 +59,15 @@ def make_folds(y, groups, n, seed):
 
 
 def fit_predict(name, sets, y, tr, ev):
-    """Allena il base model `name` sulle righe tr del train (con snapshot se *_aug) e predice ev."""
-    aug = name.endswith("_aug")
-    base = name[:-4] if aug else name
-    kind, make = MODELS[base]
-    X, _ = get_X(sets, kind)
-    if aug:
-        S = get_snap(sets, kind)
-        sm = np.isin(sets["snap_ids"], sets["train_ids"][tr])  # snapshot dei soli battle di training
-        Xa = pd.concat([X.iloc[tr], S[sm]], ignore_index=True)
-        ya = np.concatenate([y[tr], sets["snap_y"][sm]])
-        wa = np.concatenate([np.ones(len(tr)), np.full(sm.sum(), stacking.AUG_WEIGHT)])
-        m = make().fit(Xa, ya, sample_weight=wa)
-    else:
-        m = make().fit(X.iloc[tr], y[tr])
-    return m.predict_proba(X.iloc[ev])[:, 1]
+    """Fits base model `name` on the training rows tr and predicts the rows ev."""
+    base = name[:-4] if name.endswith("_aug") else name
+    X = get_X(sets, MODELS[base][0])[0]
+    return fit_model(name, sets, y, tr).predict_proba(X.iloc[ev])[:, 1]
 
 
 def run_model(name, sets, y, outer, inner):
-    """Per un base model: OOF interne (per il meta) e predizioni esterne."""
-    jobs = []  # (fold esterno, indici train, indici da predire, tipo)
+    """Inner OOF predictions (for the meta-learner) and outer predictions of one base model."""
+    jobs = []  # (outer fold, training rows, rows to predict, kind)
     for k in range(N_OUTER):
         tr_o = np.where(outer != k)[0]
         jobs.append((k, tr_o, np.where(outer == k)[0], "outer"))
@@ -109,39 +96,11 @@ def metrics(y, p, fold):
             "acc_per_fold": [acc[fold == k].mean() for k in range(N_OUTER)]}
 
 
-def select_columns(sets, keep=(), drop=()):
-    """Restringe le feature: solo le colonne con prefisso in keep (se dato), senza quelle in drop."""
-    def f(X):
-        cols = [c for c in X.columns if (not keep or c.startswith(tuple(keep))) and not c.startswith(tuple(drop))]
-        return X[cols]
-    for k in ("full", "dense"):
-        sets[k] = tuple(f(X) for X in sets[k])
-    for k in ("snap_full", "snap_dense"):
-        sets[k] = f(sets[k])
-    return sets
-
-
-def meta_inputs(models, P, regimes, R):
-    """Logit dei base model; con il gating, anche gli indicatori di regime e le interazioni
-    regime x logit dell'esperto corrispondente (il meta impara quanto fidarsi dell'esperto)."""
-    Z = [_z(P[m]) for m in models]
-    for r in regimes:
-        Z.append(R[r])
-        for m in models:
-            if m.endswith(f"_exp_{r}"):
-                Z.append(R[r] * _z(P[m]))
-    return np.column_stack(Z)
-
-
-def evaluate(name, models, extra, keep=(), drop=(), gate=()):
+def evaluate(name, models):
     out_dir = os.path.join(EXP, name)
-    os.makedirs(out_dir, exist_ok=True)
     cache = os.path.join(out_dir, "models")
     os.makedirs(cache, exist_ok=True)
-    sets, y, _ = load_data(extra)
-    if keep or drop:
-        sets = select_columns(sets, keep, drop)
-        print(f"feature selezionate: {sets['full'][0].shape[1]} (keep={keep}, drop={drop})")
+    sets, y, _ = load_data()
     train = load_jsonl(os.path.join(DATA, "train.jsonl"))
     assert [b["battle_id"] for b in train] == list(sets["train_ids"])
     groups = duplicate_groups(train)
@@ -152,7 +111,7 @@ def evaluate(name, models, extra, keep=(), drop=(), gate=()):
         f = np.full(len(y), -1)
         f[tr_o] = make_folds(y[tr_o], groups[tr_o], N_INNER, SEED + 100 + k)
         inner[k] = f
-    print(f"{len(set(groups))} gruppi su {len(y)} battaglie (duplicati nello stesso fold)", flush=True)
+    print(f"{len(set(groups))} groups over {len(y)} battles (duplicates kept in the same fold)", flush=True)
 
     inner_oof, outer_pred = {}, {}
     for m in models:
@@ -166,40 +125,35 @@ def evaluate(name, models, extra, keep=(), drop=(), gate=()):
             np.savez(path, inner=inner_oof[m], outer=outer_pred[m])
         print(f"{m:20s} outer acc {((outer_pred[m] > 0.5) == y).mean():.4f} ({time.time() - t0:.0f}s)", flush=True)
 
-    R = {r: REGIMES[r](sets["full"][0]).values.astype(float) for r in gate}
-    stack = np.zeros(len(y))
-    mean = np.zeros(len(y))
+    stack, mean = np.zeros(len(y)), np.zeros(len(y))
     for k in range(N_OUTER):
         tr_o, va_o = outer != k, outer == k
-        Z = meta_inputs(models, {m: inner_oof[m][k, tr_o] for m in models}, gate, {r: v[tr_o] for r, v in R.items()})
-        Zv = meta_inputs(models, {m: outer_pred[m][va_o] for m in models}, gate, {r: v[va_o] for r, v in R.items()})
-        meta = LogisticRegression(C=1.0, max_iter=2000).fit(Z, y[tr_o])
-        stack[va_o] = meta.predict_proba(Zv)[:, 1]
-        mean[va_o] = 1 / (1 + np.exp(-np.mean([_z(outer_pred[m][va_o]) for m in models], axis=0)))
+        Z = np.column_stack([_z(inner_oof[m][k, tr_o]) for m in models])
+        Zv = np.column_stack([_z(outer_pred[m][va_o]) for m in models])
+        stack[va_o] = LogisticRegression(C=1.0, max_iter=2000).fit(Z, y[tr_o]).predict_proba(Zv)[:, 1]
+        mean[va_o] = 1 / (1 + np.exp(-Zv.mean(axis=1)))
 
     pred = pd.DataFrame({"battle_id": sets["train_ids"], "y_true": y, "fold": outer})
     for m in models:
         pred[f"p_{m}"] = outer_pred[m]
-    pred["p_mean"] = mean
-    pred["p_stack"] = stack
-    pred["pred"] = (stack > 0.5).astype(int)
+    pred["p_mean"], pred["p_stack"], pred["pred"] = mean, stack, (stack > 0.5).astype(int)
     pred.to_csv(os.path.join(out_dir, "predictions.csv"), index=False)
     res = {"stack": metrics(y, stack, outer), "mean": metrics(y, mean, outer),
            "base": {m: metrics(y, outer_pred[m], outer) for m in models}}
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(res, f, indent=1, default=float)
     with open(os.path.join(out_dir, "config.json"), "w") as f:
-        json.dump({"models": models, "extra": extra, "keep": keep, "drop": drop, "seed": SEED, "outer": N_OUTER, "inner": N_INNER,
-                   "aug_weight": stacking.AUG_WEIGHT, "meta": "logreg C=1 sui logit", "gate": gate, "threshold": 0.5}, f, indent=1)
+        json.dump({"models": models, "seed": SEED, "outer": N_OUTER, "inner": N_INNER,
+                   "meta": "logistic regression C=1 on logits", "threshold": 0.5}, f, indent=1)
     s = res["stack"]
     print(f"\nNESTED stack (logreg) acc {s['acc']:.4f} | AUC {s['auc']:.4f} | logloss {s['logloss']:.4f}")
     print("  per fold:", " ".join(f"{a:.4f}" for a in s["acc_per_fold"]))
-    print(f"NESTED media dei logit acc {res['mean']['acc']:.4f}")
+    print(f"NESTED mean of logits acc {res['mean']['acc']:.4f}")
     return res
 
 
 def compare(a, b, n_boot=5000):
-    """Differenza appaiata di accuracy (b - a) sulle stesse battaglie, con IC bootstrap al 95%."""
+    """Paired accuracy difference (b - a) on the same battles, with a 95% bootstrap CI."""
     A = pd.read_csv(os.path.join(EXP, a, "predictions.csv"))
     B = pd.read_csv(os.path.join(EXP, b, "predictions.csv"))
     assert (A.battle_id.values == B.battle_id.values).all()
@@ -210,11 +164,9 @@ def compare(a, b, n_boot=5000):
     boot = np.array([d[rng.integers(0, len(d), len(d))].mean() for _ in range(n_boot)])
     lo, hi = np.percentile(boot, [2.5, 97.5])
     per_fold = [d[A.fold.values == k].mean() for k in range(N_OUTER)]
-    print(f"{a}: {ca.mean():.4f}  {b}: {cb.mean():.4f}  diff {d.mean():+.4f}  IC95 [{lo:+.4f}, {hi:+.4f}]  "
+    print(f"{a}: {ca.mean():.4f}  {b}: {cb.mean():.4f}  diff {d.mean():+.4f}  CI95 [{lo:+.4f}, {hi:+.4f}]  "
           f"P(diff>0) {np.mean(boot > 0):.2f}")
     print("  diff per fold:", " ".join(f"{x:+.4f}" for x in per_fold))
-    print(f"  battaglie: {int(((cb == 1) & (ca == 0)).sum())} corrette solo da {b}, "
-          f"{int(((ca == 1) & (cb == 0)).sum())} solo da {a}")
     return d.mean(), (lo, hi), per_fold
 
 
@@ -222,11 +174,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="")
     ap.add_argument("--models", default="logreg,lgbm,xgb,catboost")
-    ap.add_argument("--extra", default="mc,rec")
-    ap.add_argument("--keep", default="", help="prefissi delle sole feature da usare (es. strat_,prob_)")
-    ap.add_argument("--drop", default="", help="prefissi delle feature da escludere")
-    ap.add_argument("--gate", default="", help="regimi per il gating del meta (attrition,balanced,setup)")
-    ap.add_argument("--aug-weight", type=float, default=None, help="peso degli snapshot nei modelli *_aug")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
     ap.add_argument("--n-jobs", type=int, default=0)
     ap.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
@@ -236,10 +183,7 @@ def main():
         return
     configure(args.n_jobs, args.device)
     print(describe(), flush=True)
-    if args.aug_weight is not None:
-        stacking.AUG_WEIGHT = args.aug_weight
-    split = lambda v: [x for x in v.split(",") if x]
-    evaluate(args.name, split(args.models), split(args.extra), split(args.keep), split(args.drop), split(args.gate))
+    evaluate(args.name, [m for m in args.models.split(",") if m])
 
 
 if __name__ == "__main__":

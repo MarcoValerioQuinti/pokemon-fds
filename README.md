@@ -1,481 +1,261 @@
 # Pokémon Gen 2 OU battle outcome prediction
 
-Classical machine-learning pipeline (no neural networks) for the Kaggle competition
-FDS Pokémon Battles Prediction 2026:
-given the first 30 turns of a competitive Gen 2 OU battle, predict whether player 1 wins.
+Classical machine learning (no neural networks) for the Kaggle competition FDS Pokémon Battles
+Prediction 2026: given the first 30 turns of a competitive Gen 2 OU battle, predict whether player 1
+wins.
 
-**Final model:** a stack of 10 diverse base models with a logistic-regression meta-learner, built on
-hand-crafted battle-state features plus Monte Carlo and recursive roll-out features.
+The solution stacks diverse base models trained on four kinds of input:
+- hand-crafted battle-state features built on a Gen 2 damage engine;
+- Monte Carlo simulations of the rest of each battle;
+- roll-outs of a learned turn-to-turn transition model;
+- snapshot augmentation of the training battles.
 
-| Estimate | Accuracy |
-|---|---|
-| Out-of-fold, meta evaluated with 5×5 repeated CV | **0.6994 ± 0.010** |
-| Nested CV of the whole stacking procedure (5 outer × 5 inner folds) | **0.6957** (folds 0.686–0.710) |
-| 95% confidence interval of the OOF accuracy | about ±0.9 points |
+| Selected submission | Base models | Meta-learner | 5-fold CV accuracy |
+|---|---|---|---|
+| `stack10` | 10 diverse models | logistic regression | **0.6956 ± 0.011** |
+| `stack22` | all 22 models of the zoo | logistic regression | 0.6935 ± 0.010 |
+| `stack10_mean` | the same 10 models | mean of logits | 0.6942 ± 0.011 |
 
-All results are local cross-validation estimates; nothing has been tuned on the Kaggle leaderboard.
-
----
+The meta-learner is evaluated with 5-fold CV repeated 5 times; ± is the standard deviation over the
+folds. The 95% confidence interval of an accuracy measured on the 10,000 training battles is about
+±0.9 points.
 
 ## Contents
 
-1. [The problem and the data](#1-the-problem-and-the-data)
-2. [Repository layout](#2-repository-layout)
-3. [Quick start](#3-quick-start)
-4. [Feature engineering](#4-feature-engineering)
-5. [Simulation-based features](#5-simulation-based-features)
-6. [Models and stacking](#6-models-and-stacking)
-7. [Evaluation methodology](#7-evaluation-methodology)
-8. [Results](#8-results)
-9. [Statistical reports](#9-statistical-reports)
-10. [What did not work](#10-what-did-not-work)
-11. [Hardware and portability](#11-hardware-and-portability)
+1. [Data](#1-data)
+2. [Repository layout and usage](#2-repository-layout-and-usage)
+3. [Feature engineering](#3-feature-engineering)
+4. [Simulation-based features](#4-simulation-based-features)
+5. [Models and stacking](#5-models-and-stacking)
+6. [Validation](#6-validation)
+7. [Results and what did not work](#7-results-and-what-did-not-work)
+8. [Data sources and domain knowledge](#8-data-sources-and-domain-knowledge)
+9. [Hardware and portability](#9-hardware-and-portability)
 
----
+## 1. Data
 
-## 1. The problem and the data
-
-| File | Content |
-|---|---|
-| `data/train.jsonl` | 10,000 battles with the label `player_won` (exactly 50% wins) |
-| `data/test.jsonl` | 5,000 battles to predict |
-| `data/type_chart_gen2.csv` | Gen 2 type-effectiveness chart |
-| `data/sample_submission.csv` | Submission format (`battle_id`, `player_won`) |
+The competition files (`train.jsonl` with 10,000 labeled battles, `test.jsonl` with 5,000, the
+Gen 2 type chart and the sample submission) go in `data/`; see [`data/README.md`](data/README.md).
 
 For every battle we get:
+- **Player 1:** the full team (base stats, types, level, item), without moves.
+- **Player 2:** only the lead Pokémon.
+- **The timeline:** exactly 30 turns, with each active Pokémon's state (HP, status, boosts,
+  effects) and the move it used (name, type, category, power, accuracy, priority).
 
-- **Player 1:** the full team of 6 Pokémon (base stats, types, level, item). Moves are *not* given.
-- **Player 2:** only the lead Pokémon. The rest of the team appears only when it enters the field.
-- **The timeline:** always exactly **30 turns**. Each turn has each active Pokémon's state (HP %,
-  status, boosts, volatile effects) and the move it used (name, type, category, base power,
-  accuracy, priority).
+Facts that shape the design:
 
-Facts about the data that shape the whole design:
+- **Most of the outcome happens after turn 30.** In turns 1–30 player 1 suffers about 3× more KOs
+  than player 2, yet wins 50% of the games; only 0.6% of the battles are already over.
+- **Reported moves are sticky.** The move field repeats a Pokémon's last move even on turns where
+  it did not act (about 25% of the moves). Filtering them out lowers the CV by 0.3–0.5 points,
+  because the repetitions carry information (time on the field, re-entries), so the raw moves are
+  kept.
+- **Duplicates.** 27 groups of battles have identical timelines, and their labels always agree.
+  Cross-validation keeps them in the same fold. The 7 test battles identical to a training battle
+  receive its label (`stacking.duplicate_override`).
+- **No leakage and no shift.** `battle_id` has AUC 0.505 for the label, and a train-vs-test
+  classifier reaches AUC 0.501. Train and test `battle_id`s overlap, so rows are keyed by
+  (`battle_id`, `is_test`).
 
-- **Most of the outcome is not observable.** Battles usually continue well past turn 30.
-  - In turns 1–30, player 1 suffers about 3× more KOs than player 2 (1.69 vs 0.50 on average),
-    yet wins 50% of the games.
-  - Only 0.6% of the battles are already over at turn 30.
-  - So the dynamics after turn 30 are different from those observed.
-- **Reported moves are sticky.** After a Pokémon's first move, the move field keeps showing its
-  *last* move even on turns where it did not act (switch-ins, sleep, freeze, replacement after a
-  KO). About 25% of the reported moves were never executed. A helper detects real actions, but
-  the raw moves are kept for most features because they carry useful signal (time on field,
-  re-entries).
-- **Teams come from a recurring pool.**
-  - The 15,000 player-1 teams contain only 5,607 distinct teams.
-  - 75% of the player-2 teams seen in full also appear as player-1 teams.
-  - This lets us infer player 2's hidden Pokémon by matching whole teams.
-- **Duplicates.** There are 27 groups of battles with identical timelines, and their labels are
-  always consistent.
-  - Cross-validation keeps them in the same fold.
-  - The 7 test battles identical to a training battle receive its label.
-- **No leakage, no shift.**
-  - `battle_id` has AUC 0.505 for the label.
-  - A train-vs-test adversarial classifier reaches AUC 0.501.
-  - No feature has a significantly different train/test distribution.
-  - Train and test `battle_id`s overlap, so rows are always keyed by (`battle_id`, `is_test`).
-
-## 2. Repository layout
+## 2. Repository layout and usage
 
 ```
-data/                      competition data, not versioned (see data/README.md)
 src/
-  features.py              battle-state features, Gen 2 damage engine, label-free context
-  train.py                 feature cache + first 4-model prototype
-  simulate.py              Monte Carlo simulator of the rest of the battle
-  recursive.py             turn-by-turn transition model and recursive roll-outs
-  strategic.py             team-wide matchup and probabilistic KO features (experimental)
-  team_infer.py            hidden-team inference from the team pool + reconstruction test
-  longitudinal.py          per-Pokémon history features (experimental)
-  stacking.py              base model zoo, out-of-fold predictions, meta-learner
-  final_model.py           final 10-model stack and submission
-  evaluate_nested.py       nested CV of the whole stacking procedure + paired comparisons
-  analyze_errors.py        OOF error analysis by game regime
-  compute.py               cores / GPU / multiprocessing configuration (macOS, Linux, Windows)
-tests/test_damage.py       damage engine checked against Pokémon Showdown's Gen 2 formula
-reports/
-  01_report_statistico_dati.ipynb     data statistics and significance
-  02_report_costi_benefici.ipynb      cost/benefit of every method and model
-  build_notebooks.py                  generates both notebooks
-kaggle/
-  pokemon-fds-final.ipynb             self-contained Kaggle notebook: trains the final model, writes submission.csv
-  build_kaggle_notebook.py            builds the notebook from src/ and kernel-metadata.json
-  README.md                           how to submit from the Kaggle website or the Kaggle CLI
-outputs/                   caches, OOF predictions, experiments, submissions (generated)
+  dataset.py          paths, reference context learned from the training set, feature cache, bag-of-words
+  features.py         battle-state features and the Gen 2 damage engine
+  simulate.py         Monte Carlo simulation of the rest of each battle
+  recursive.py        turn-to-turn transition model and recursive roll-outs
+  stacking.py         base model zoo and out-of-fold predictions with snapshot augmentation
+  final_model.py      the stacking configurations and their submissions
+  evaluate_nested.py  nested cross-validation of the whole stacking procedure, paired comparisons
+  strict_cv.py        cross-validation that re-learns every data-derived component inside each fold
+  compute.py          cores, GPU and multiprocessing settings (macOS, Linux, Windows)
+tests/test_damage.py  damage engine checked against Pokémon Showdown's Gen 2 formula
+kaggle/               the competition notebook (clones this repository) and its guide
+data/                 competition data, not versioned
+outputs/              caches, out-of-fold predictions and submissions, not versioned
 ```
 
-The notebooks are written in Italian, and their content is summarized in [section 9](#9-statistical-reports).
-They are committed with their outputs. Re-running them needs the cached predictions of every
-experiment in `outputs/`, which is not versioned: the OOF folders and the nested experiments
-produced by `stacking.py` and `evaluate_nested.py`.
-
-## 3. Quick start
-
-First download the competition data into `data/` (see [`data/README.md`](data/README.md)).
-
 ```bash
-conda create -n pokemon-fds python=3.13
-conda activate pokemon-fds
+conda create -n pokemon-fds python=3.13 && conda activate pokemon-fds
 pip install -r requirements.txt
-# macOS only: LightGBM needs OpenMP
-conda install -c conda-forge llvm-openmp
+conda install -c conda-forge llvm-openmp        # macOS only: OpenMP for LightGBM
 
-python src/simulate.py        # Monte Carlo features (100 simulations per battle), ~3 min
-python src/recursive.py       # recursive roll-out features, ~2 min
-python src/final_model.py     # features + 10 base models + meta-learner -> outputs/submission_final.csv, ~7 min
-```
-
-The data and output folders default to `data/` and `outputs/`. The `POKEMON_DATA` and `POKEMON_OUT`
-environment variables override them; the Kaggle notebook sets both.
-
-**Submitting on Kaggle.** [`kaggle/`](kaggle/README.md) contains a self-contained notebook that runs
-this same pipeline on the competition data and writes `submission.csv`, plus a step-by-step guide
-for the website and the Kaggle CLI.
-
-Other entry points:
-
-```bash
-python src/stacking.py --models lgbm,xgb --extra mc,rec      # OOF of single base models (cached per model)
-python src/stacking.py --meta --extra mc,rec                 # meta-learner over every cached OOF
-python src/evaluate_nested.py --name X --models a,b --extra mc,rec
-python src/evaluate_nested.py --compare X Y                  # paired accuracy difference with bootstrap CI
-python src/analyze_errors.py --name X
+python src/simulate.py      # Monte Carlo features, ~3 min
+python src/recursive.py     # recursive roll-out features, ~2 min
+python src/final_model.py   # features + 22 base models + 3 submissions in outputs/, ~12 min
 python -m pytest tests -q
 ```
 
-**Caches.** Features, simulations and OOF predictions are cached in `outputs/`.
+- **Timings** are on an Apple M5 with 10 cores.
+- **Folders:** `POKEMON_DATA` and `POKEMON_OUT` override `data/` and `outputs/`.
+- **Caches:** features, simulations and out-of-fold predictions are cached in `outputs/`. Delete
+  them after changing the corresponding code.
+- **Kaggle:** the notebook in [`kaggle/`](kaggle/README.md) clones this repository at a fixed
+  commit and regenerates the 3 selected submissions.
 
-- If `features.py` changes, delete `outputs/features*.pkl` and the OOF folders.
-- If a simulator changes, delete its `.pkl` and the OOF folders that use it.
+## 3. Feature engineering
 
-Timings are on an Apple M5 with 10 cores.
+Every battle becomes one row describing the state at the last observed turn: about 280 dense
+features plus about 990 bag-of-words columns (`features.py`).
 
-## 4. Feature engineering
+- **Side state** (`p1_`, `p2_`, `diff_`):
+  - seen, fainted and alive Pokémon;
+  - total HP, with the unseen Pokémon at 100%, and mean HP of the alive ones;
+  - status counts and status-weighted effective HP.
+  - Player 2's unseen Pokémon enter with their expected stats, from team co-occurrence.
+- **Trajectory:** HP and KO differences over the turns, checkpoints 5–25 turns before the end,
+  slope, minimum and maximum, first and last KO.
+- **Team and active Pokémon:**
+  - base-stat aggregates of the teams and of the alive Pokémon;
+  - for the actives: HP, status, boosts and volatile effects, and their mutual type effectiveness.
+- **Play style:** switches, damage dealt, super-effective hits, moves by category, Spikes, Rapid
+  Spin, healing, setup, phazing and sleep moves.
+- **Damage-based matchups:**
+  - a damage matrix between the alive Pokémon, using each one's revealed moves (the species' most
+    used attacks when none is revealed, else a generic STAB move);
+  - from the matrix: best-hit damage, OHKO/2HKO fractions, "checked" opponents, hits needed to KO
+    the opposing team;
+  - the duel between the actives, with boosts, paralysis and Substitute;
+  - Spikes in chronological order;
+  - Rest sleep versus induced sleep;
+  - setup that cannot be phazed, alive clerics and status burden.
+- **Bag-of-words:** counts of Pokémon (team, alive, seen) and of moves for both sides
+  (`CountVectorizer`, `min_df=20`).
 
-Every battle becomes one row describing the state at the **last observed turn**. There are about
-280 dense features, plus about 990 bag-of-words columns.
+The damage engine uses Gen 2 stats at maximum DVs and stat experience, the type-based
+physical/special split, STAB, the type chart and the mean damage roll. `tests/test_damage.py`
+checks it within 3% of Showdown's exact integer formula (15 tests).
 
-### Side state (`p1_`, `p2_`, `diff_` prefixes)
+**Nothing is learned from the test set.** The pokédex, Hidden Power types, co-occurrence, move
+statistics and bag-of-words vocabulary are learned from the training battles only
+(`dataset.build_reference`, `dataset.add_bags`). Test battles are only transformed; a species absent
+from the training set takes the stats described in its own battle, or average stats.
 
-- Seen, fainted and alive Pokémon.
-- **Total HP** (unseen Pokémon counted at 100%), mean HP of the alive Pokémon, count of low-HP
-  Pokémon.
-- Status counts; healthy Pokémon (neither asleep nor frozen).
-- Status-weighted **effective HP** (sleep/freeze ×0.5, paralysis/toxic ×0.8).
-- Player 2's unseen Pokémon enter with their *expected* stats (see the label-free context below),
-  so both sides are compared on the same footing.
+## 4. Simulation-based features
 
-### Trajectory
+- **Monte Carlo** (`simulate.py`): a simplified Gen 2 simulator plays each battle to the end 100
+  times from the last observed state.
+  - **Randomness:** player 2's unseen Pokémon sampled from co-occurrence, damage rolls, critical
+    hits, accuracy, sleep duration, full paralysis, thawing.
+  - **Mechanics:** speed order, residual damage, Leftovers, Spikes and healing.
+  - **Decisions:** switches out of bad matchups, matchup-based replacements.
+  - **Features:** win rate and its spread, final HP difference with quantiles, KOs, remaining turns.
+- **Recursive model** (`recursive.py`): four LightGBM models learn one turn of the battle (HP
+  deltas and KO probability per side) from 274k transitions of the training battles. From the
+  last turn they are applied to their own outputs, 30 roll-outs per battle; the short-horizon HP
+  difference is the useful signal.
 
-- HP and KO differences at every turn.
-- Checkpoints 5, 10, 15, 20 and 25 turns before the end.
-- Slope, min, max and mean of the HP difference; change over the last 10 turns.
-- First and last KO turn.
+Both feature sets are also computed on the training snapshots used for augmentation.
 
-### Team and active Pokémon
+## 5. Models and stacking
 
-- Base-stat aggregates of player 1's team and of player 2's lead; stat sums of the alive Pokémon;
-  HP-weighted base-stat total.
-- For the active Pokémon at the last turn: HP, status, boosts, volatile effects (substitute,
-  leech seed, confusion…), mutual STAB type effectiveness.
+- **Snapshot augmentation:** inside each training fold, the fold's battles truncated at turns 24,
+  26 and 28 are added with weight 0.5. Validation always uses the full 30 turns. Models trained this
+  way have the `_aug` suffix.
+- **Base model zoo** (`stacking.MODELS`, 22 models):
 
-### Play style
+  | Family | Models |
+  |---|---|
+  | Gradient boosting | LightGBM, XGBoost and CatBoost, on all features and on the dense set without bag-of-words, with and without augmentation |
+  | Bagged trees | ExtraTrees, Random Forest |
+  | Linear and kernel | logistic regressions (standardized or quantile-normalized), RBF SVM, kNN on PCA |
+  | Gaussian generative | LDA with shrinkage, QDA on PCA, full-covariance Gaussian mixtures on a supervised PLS projection |
+  | Noise-regularized | LightGBM and XGBoost trained on copies of the data with Gaussian noise |
 
-- Switches, turns without a move, damage dealt, super-effective hits, moves by category.
-- Spikes, rapid spin, healing, setup and phazing moves, sleep moves, explosions, number of
-  distinct moves.
-
-### Matchup features from a Gen 2 damage engine
-
-The damage engine:
-
-- uses stats at maximum DVs and stat experience: `((base + 15) * 2 + 63) * L / 100 + 5`;
-- decides the physical/special category by **type**, as in Gen 2;
-- applies STAB, the type chart, Thick Club / Light Ball, and Explosion halving defense;
-- uses the mean random roll (217–255/255) and scales damage by accuracy;
-- gives Hidden Power the type that best explains the observed damage; Return and Frustration
-  power 102; Seismic Toss and Night Shade damage equal to the level.
-
-`tests/test_damage.py` re-implements Pokémon Showdown's integer Gen 2 formula and checks the
-engine within 3% (15 tests).
-
-On top of the engine, the matchup features are:
-
-- **Damage matrix** between alive Pokémon, using each Pokémon's revealed moves. If none are
-  revealed, the species' most common attacking moves are used; failing that, a generic STAB move.
-  From the matrix: best-hit damage, OHKO/2HKO fractions, OHKO before being hit, "checked"
-  opponents, hits needed to KO the whole opposing team.
-- **Active duel:** with boosts, paralysis, substitute and speed order.
-- **Spikes:** tracked chronologically (Rapid Spin fails against Ghost types).
-- **Sleep:** Rest sleep (about to wake) is separated from induced sleep (turns already used).
-- **Win conditions:** unphazable setup, alive clerics, status burden.
-
-### Bag of words
-
-Counts of Pokémon (team, alive, seen) and moves for both sides (`CountVectorizer`,
-`min_df=20`), plus active-status dummies.
-
-### Label-free context
-
-Some statistics are computed once on **train + test together without ever touching the
-label**, and are reused identically at inference:
-
-- species pokédex;
-- Hidden Power types;
-- species co-occurrence;
-- most common moves per species;
-- the team pool;
-- the bag-of-words vocabulary.
-
-Scalers and projections (StandardScaler, QuantileTransformer, PCA, PLS) are always fit inside
-the folds.
-
-## 5. Simulation-based features
-
-### Monte Carlo (`simulate.py`)
-
-A simplified Gen 2 simulator plays each battle to the end from the last observed state, 100
-times.
-
-- **Hidden information:** player 2's missing Pokémon are sampled from team co-occurrence.
-- **Randomness:** damage rolls, critical hits (17/256), accuracy.
-- **Mechanics:** speed order (paralysis ×0.25); sleep duration (Rest = 2 turns, induced = random);
-  thawing; poison, burn and toxic damage; Leftovers; Spikes on entry; healing below 40% HP.
-- **Decisions:** voluntary switches out of bad matchups, matchup-based replacement choice.
-
-Features: simulated win rate and its spread, final HP difference with p10/p90 quantiles, KOs,
-remaining turns. `mc_win` alone reaches 0.63 accuracy.
-
-### Recursive model (`recursive.py`)
-
-An RNN-like recursion built with gradient boosting:
-
-- **State:** an aggregate state per turn, with an exponential moving average of past HP and KO
-  deltas as "memory".
-- **Transitions:** four LightGBM models learn turn-to-turn transitions (HP deltas and KO
-  probability per side) from about 411k unlabeled transitions.
-- **Roll-out:** 30 roll-outs per battle, from turn 30 until a team is exhausted.
-
-Only the short horizon is informative: the HP difference after 10 simulated turns has AUC 0.718.
-The simulated winner is not (AUC 0.57), because the model only sees turns 1–30.
-
-Both feature sets are also computed on training snapshots, for augmentation.
-
-## 6. Models and stacking
-
-### Snapshot augmentation
-
-Every training battle is also truncated at turns 24, 26 and 28. The truncated copies have the
-same label and weight 0.5.
-
-- They are added **only inside the training folds**, and only for the battles of that fold.
-- Validation always uses the turn-30 state.
-- Models trained this way have the `_aug` suffix.
-
-### Final stack (`final_model.py`)
-
-| Family | Base models | Feature set |
-|---|---|---|
-| Gradient boosting with augmentation | `lgbm_aug`, `xgb_aug`, `catboost_aug` | all features |
-| Gradient boosting with augmentation | `lgbm_dense_aug`, `catboost_dense_aug` | dense features (no bag of words) |
-| Bagged deep trees | `extratrees`, `rf` | all features |
-| Linear / generative | `lda` (shrinkage), `logreg` (standardized) | all / dense |
-| Linear / generative | `logreg_dense` (quantile-normalized) | dense |
-
-- **Base models:** each produces out-of-fold (OOF) probabilities with a stratified 5-fold split
-  (seed 42). Test predictions are averaged over the folds.
-- **Meta-learner:** a logistic regression (C = 1) on the logits of the OOF probabilities, with
+  Every scaler and projection is fitted inside the training fold.
+- **Out-of-fold predictions:** each base model gets out-of-fold predictions from a stratified
+  5-fold split (seed 42). Its test predictions are the mean of the 5 fold models.
+- **Meta-learner:** a logistic regression (C = 1) on the logits of the out-of-fold predictions,
   threshold 0.5.
-- **Duplicates:** the 7 test battles that duplicate a training battle take its label.
+- **The 3 selected configurations** (`final_model.CONFIGS`):
+  - **`stack10`:** 10 models kept by a leave-one-model-out cost/benefit analysis of the zoo: the
+    boosting models with augmentation, ExtraTrees, Random Forest, LDA and the two logistic
+    regressions. It keeps the models that make different errors; the out-of-fold residuals of the
+    22 models correlate at 0.97 on average.
+  - **`stack22`:** the whole zoo, a hedge against having pruned too closely to the folds.
+  - **`stack10_mean`:** the 10 models averaged without learned weights, the most robust to
+    overfitting of the stacking layer.
 
-The 10 models were chosen by a cost/benefit analysis (section 9). Starting from a zoo of 22 base
-models, we kept the ones that bring **diversity** and dropped the redundant ones.
+## 6. Validation
 
-| Dropped | Why |
-|---|---|
-| SVM, kNN, QDA, Gaussian mixtures | No marginal value |
-| LightGBM / XGBoost / CatBoost without augmentation | Redundant with the `_aug` versions |
-| Gaussian-noise variants | No marginal value |
-| Regime-specific experts | Slightly harmful |
-
-## 7. Evaluation methodology
-
-- **OOF evaluation:** stratified 5-fold for the base models. The meta-learner is evaluated with a
-  5-fold CV repeated 5 times (seed 43).
-- **Nested evaluation (`evaluate_nested.py`).** For each of 5 outer folds, the whole stacking
-  procedure is re-run on the outer training part:
-  1. inner 5-fold OOF;
+- **Local validation only.** All decisions use cross-validation on `train.jsonl`. The public
+  leaderboard is used only as an occasional sanity check.
+- **Nested CV** (`evaluate_nested.py`): for each of 5 outer folds, the whole stacking procedure is
+  re-run on the outer training part, then scores the untouched outer fold:
+  1. inner out-of-fold predictions;
   2. fitting the meta-learner;
-  3. refitting the base models;
-  4. predicting the untouched outer fold.
+  3. refitting the base models.
 
-  Duplicates are grouped in the same fold, and snapshots only ever come from training battles.
-- **Paired comparisons:** variants are compared on the *same* battles, with a bootstrap 95% CI of
-  the accuracy difference (5,000 resamples) and an exact McNemar test.
-  - Two similar stacks disagree on about 6% of the battles.
-  - So the smallest detectable difference is about **±0.5 accuracy points**.
-- **Acceptance rule:** a change is kept only if the gain is reproducible, is not explained by
-  leakage, and does not depend on a single fold.
+  Duplicates stay in the same fold. With the earlier version of the context, the nested estimate
+  of `stack10` was 0.6957 against 0.6994 non-nested: the model selection costs about 0.4 points of
+  optimism.
+- **Strict CV** (`strict_cv.py`): the pokédex, context statistics, bag-of-words vocabulary, Monte
+  Carlo context and transition model are re-learned from each training fold, so the validation
+  fold is treated exactly like the test set.
+- **Paired comparisons:** variants are compared on the same battles, with a bootstrap 95% CI of the
+  accuracy difference and an exact McNemar test.
+  - Two similar stacks disagree on about 6% of the battles, so the smallest detectable difference
+    is about ±0.5 points.
+  - A change is kept only if its gain is reproducible and does not depend on a single fold.
 
-## 8. Results
-
-### Progression
+## 7. Results and what did not work
 
 | Model | CV accuracy |
 |---|---|
-| Baseline: sign of the KO difference | 0.581 |
-| Baseline: sign of the HP difference | 0.631 |
-| Single LightGBM, first feature set | 0.683 |
-| 4-model average (logreg, LightGBM, XGBoost, CatBoost) | 0.692 |
-| 17-model stack | 0.693 |
-| + snapshot augmentation + Monte Carlo + recursive features, 22 models | 0.6981 ± 0.011 |
-| **Final 10-model stack** | **0.6994 ± 0.010** |
+| Sign of the HP difference at turn 30 | 0.631 |
+| Single LightGBM | 0.683 |
+| Best single base model (`xgb_aug` / `lgbm_aug`) | 0.689 |
+| 4-model average (logistic regression, LightGBM, XGBoost, CatBoost) | 0.692 |
+| **`stack10`** | **0.6956** |
 
-### Final vs previous best
+Tried, measured with paired comparisons and removed:
+- hyperparameter tuning with Optuna (no gain);
+- filtering the sticky moves (−0.3 to −0.5 points);
+- more folds and repeated k-fold (the stack gets worse: averaged predictions lose diversity);
+- regime-specific expert models, alone and with a gated meta-learner;
+- a median decision threshold (the predictions are already balanced);
+- team-wide probabilistic matchup features;
+- hidden-team inference from a pool of recurring teams;
+- per-Pokémon history features.
 
-Final 10-model stack against the 22-model stack, on the same battles:
+These additional features carry real signal (the matchup features alone reach 0.629), but it is
+redundant with the battle-state features: they add at most +0.2 points, below the detectable
+difference.
 
-- **Accuracy:** +0.15 points, 95% CI [−0.15, +0.45], McNemar p = 0.36. This is statistically the
-  same accuracy.
-- **Cost:** 43% less training time.
-- **Predictions:** the two submissions agree on 98.7% of the test battles.
+The ceiling is informational: the battle is mostly decided after turn 30, and the learning curve
+gains only about 0.15 points per extra 1,000 training battles.
 
-**Unbiased estimate.** The 10 models were chosen by looking at the same OOF predictions, so
-0.6994 is slightly optimistic. The nested CV of the full final procedure gives **0.6957**.
+## 8. Data sources and domain knowledge
 
-Against the nested 4-model baseline (logreg, LightGBM, XGBoost, CatBoost: 0.6911):
+The only data used are the competition files and the supplied type chart. No external databases,
+replay datasets, usage statistics or hand-collected tables are used.
 
-- the difference is +0.46 points, 95% CI [−0.03, +0.96];
-- the final stack is better in all 5 outer folds;
-- P(diff > 0) = 0.96.
+| Source | What comes from it |
+|---|---|
+| Competition data (training battles) | Pokédex (base stats, types); move attributes (type, category, base power, accuracy, priority, all read from `move_details`); Hidden Power type per species, inferred from observed damage; team co-occurrence; move frequencies per species, which also identify phazers and clerics |
+| Supplied Gen 2 type chart | All type multipliers |
+| Gen 2 game rules, encoded as mechanics | Stat and damage formulas; physical/special split by type; STAB ×1.5; damage roll 217–255/255; critical hits 17/256; stat-stage multipliers; Spikes 1/8; Leftovers 1/16; poison and burn 1/8, Toxic n/16; paralysis (speed ×0.25, 25% full paralysis); sleep (Rest 2 turns, induced 1–7); thaw 10%; Thick Club and Light Ball; fixed-power moves (Return and Frustration 102, Hidden Power 70, Seismic Toss and Night Shade equal to the level); which moves heal, set up, phaze or put to sleep |
+| Modelling choices | Simulator heuristics, such as switching when the matchup score is below −2 and healing below 40% HP; the generic 80-power STAB move for Pokémon with no revealed attack |
 
-Removing the Monte Carlo and recursive features from the final stack would cost 0.44 points
-(p = 0.11): with augmented models they are worth keeping, because they are also computed on the
-snapshots.
+Pokémon Showdown's Gen 2 damage code is used only as a reference in the tests.
 
-### Single base models (OOF)
+## 9. Hardware and portability
 
-| Model | Accuracy | Train-OOF gap | Time (5 folds) |
-|---|---|---|---|
-| xgb_aug | 0.692 | 0.09 | 32 s |
-| extratrees | 0.689 | 0.31 | 56 s |
-| lgbm_aug | 0.689 | 0.11 | 23 s |
-| catboost_aug | 0.689 | 0.27 | 93 s |
-| lda | 0.687 | 0.02 | 1 s |
-| logreg_dense | 0.682 | 0.03 | 2 s |
+`compute.py` lets every script run on macOS, Linux and Windows.
 
-## 9. Statistical reports
-
-### `01_report_statistico_dati.ipynb`: the data and how significant the results are
-
-- **Classes:** exactly balanced.
-- **State vs win:** the win probability rises monotonically with the HP difference, from 0.16 in
-  the lowest decile to 0.83 in the highest (Cramér's V 0.37). The central deciles are close to a
-  coin flip.
-- **Features:**
-  - 168 of 269 features are significant after Benjamini-Hochberg correction;
-  - only 36 have |AUC − 0.5| ≥ 0.1;
-  - the strongest ones are highly correlated with each other: they all measure "who is ahead in
-    HP".
-- **Learning curve:** it flattens.
-
-  | Training battles | Accuracy |
-  |---|---|
-  | 400 | 0.640 |
-  | 3,200 | 0.667 |
-  | 8,000 | 0.681 |
-
-  The remaining slope is about +0.15 points per extra 1,000 battles.
-- **The 0.70 mark:** the 95% CI of the stack's accuracy is about [0.689, 0.707], so 0.70 cannot be
-  told apart from 0.698 on this data.
-
-### `02_report_costi_benefici.ipynb`: cost vs benefit of every component
-
-- **The ensemble pays off.**
-  - It beats the best single model by +0.6 points (p = 0.04).
-  - Its learned weights add little over a plain average of logits (+0.3, p = 0.19).
-- **Diversity matters more than individual accuracy.**
-  - OOF residuals of the 22 models correlate at 0.97 on average.
-  - In a leave-one-model-out ablation, the largest contributions come from ExtraTrees, Random
-    Forest and the augmented CatBoost models, despite their weaker standalone accuracy.
-- **Cheap stacks lose.**
-  - A stack of only cheap models loses 0.6 points (p = 0.01).
-  - The 4 classic models lose 0.9 points (p < 0.001).
-  - A nested greedy selection loses 0.6 points (p = 0.02).
-- **Components**, as accuracy difference against their own baseline, on the same battles:
-
-  | Component | Δ accuracy (points) | 95% CI | Extra cost | Verdict |
-  |---|---|---|---|---|
-  | Snapshot augmentation | +0.30 | [−0.08, +0.67] | 3.5 min | best value |
-  | Team-wide strategic matchups + team pool | +0.17 | [−0.26, +0.60] | 2 min | not proven, dropped |
-  | Per-Pokémon history | +0.12 | [−0.34, +0.59] | 14 s | not proven, dropped |
-  | Regime experts (with/without gating) | −0.06 / −0.13 | crosses 0 | | dropped |
-  | 10 folds / 5-fold × 3 repeats | −0.29 / −0.41 | crosses 0 | ×2.2 / ×3 time | dropped |
-
-## 10. What did not work
-
-All of the following were measured with paired comparisons and dropped:
-
-- **Hyperparameter tuning** of LightGBM with Optuna: 0.6877 vs 0.6879 with the defaults.
-- **Filtering sticky moves** from the features: −0.3 to −0.5 points, because the repetitions
-  carry information.
-- **More folds or repeated k-fold:** the train/OOF gap stays the same. Bagging improves single
-  models but makes OOF predictions more similar, so the stack gets worse.
-- **Gaussian input noise:** it helps XGBoost alone, but adds nothing to the stack.
-- **Regime experts** (attrition, balanced, setup games) and a regime-gated meta-learner.
-- **A median decision threshold:** the predictions are already balanced.
-- **Probabilistic KO features** from the exact damage distribution, team-wide matchup
-  assignment, hidden-team inference from the team pool, and per-Pokémon histories.
-  - These carry real signal: the strategic features alone reach 0.629.
-  - Team-pool inference recovers 55% of the hidden Pokémon vs 32% for pairwise co-occurrence.
-  - But the signal is redundant with the state features already in the stack.
-
-The ceiling is informational: what happens after turn 30 is not in the data, and every new
-direction tried lands within ±0.3 points of the current result.
-
-## 11. Hardware and portability
-
-`src/compute.py` makes every script run on macOS, Linux and Windows.
-
-| Setting | Values | Default |
-|---|---|---|
-| `--n-jobs N` / `POKEMON_N_JOBS` | worker count | all cores |
-| `--device` / `POKEMON_DEVICE` | `auto`, `cpu`, `cuda` | `auto`: CUDA when `nvidia-smi` finds a GPU, never on macOS |
-| `POKEMON_MP` | `fork`, `spawn` | `fork` on macOS/Linux, `spawn` on Windows |
-
-- **Multiprocessing:** workers receive data through an initializer, so the code works with both
-  `fork` and `spawn`.
-- **Fold-level parallelism** (`compute.fold_plan`). With 10k rows, gradient boosting does not
-  scale past a few threads, especially on CPUs that mix performance and efficiency cores (the M5
-  has 4 + 6). So several folds are trained at once, each with fewer threads.
-
-  Measured on the M5, 6 fits:
-
-  | Model | 1 worker × 10 threads | Chosen plan | Speed-up |
-  |---|---|---|---|
-  | LightGBM | 43.5 s | 3 × 3: 28.6 s | 1.5× |
-  | XGBoost | 46.7 s | 3 × 3: 29.3 s | 1.6× |
-  | CatBoost | 107 s | 2 × 5: 97 s | 1.1× |
-  | ExtraTrees | 65.8 s | 1 × 10 (unchanged) | — |
-
-  Single-thread models (linear, SVM, kNN, Gaussian) run one fold per core. The predictions are
-  bit-identical to sequential training.
-- **GPU:** with CUDA, XGBoost and CatBoost train on the GPU. LightGBM always uses the CPU.
-- **No Apple GPU (Metal / MLX) path exists for these models.** We checked:
-  - XGBoost is built without GPU support on macOS and rejects `device="mps"`;
-  - the LightGBM wheel has no GPU learner;
-  - CatBoost's GPU mode is CUDA-only;
-  - MLX is an array and neural-network framework with no tree learners.
-
-  With 10k rows, GPU histogram building would not pay off anyway. The remaining cost is
-  CPU-bound tree training.
-- **Determinism:** results are identical across `fork`, `spawn` and single-process runs. All sets
-  are sorted, so they no longer depend on hash randomization.
-
-Tested with Python 3.13, scikit-learn 1.9, LightGBM 4.7, XGBoost 3.4, CatBoost 1.2.
+- **Settings:** `--n-jobs` / `POKEMON_N_JOBS` (default: all cores), `--device` / `POKEMON_DEVICE`
+  (`auto`, `cpu`, `cuda`) and `POKEMON_MP` (`fork` or `spawn`).
+- **Multiprocessing:** workers receive their data through the pool initializer, so the results are
+  identical with `fork`, `spawn` and a single process.
+- **Fold-level parallelism:** with 10k rows, boosting scales poorly beyond ~3 threads, so several
+  folds train at once with fewer threads each. On the M5 this is 1.5× faster for LightGBM and
+  XGBoost, and the predictions are bit-identical.
+- **GPU:** with CUDA, XGBoost and CatBoost train on the GPU. These libraries have no Apple GPU
+  backend.
 
 ## License
 
-The code is released under the [MIT License](LICENSE). The competition data is not covered by
-this license and is subject to the Kaggle competition rules.
+The code is released under the [MIT License](LICENSE). The competition data is not covered by this
+license and is subject to the Kaggle competition rules.

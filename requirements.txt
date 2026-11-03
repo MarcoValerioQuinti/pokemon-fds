@@ -1,16 +1,14 @@
-numpy>=2.0
-pandas>=2.2
-scipy>=1.13
-scikit-learn>=1.5
-lightgbm>=4.3
-xgboost>=2.1
-catboost>=1.2
-joblib>=1.4
-optuna>=3.6
-matplotlib>=3.8
-pytest>=8.0
-jupyter
-nbformat
-nbconvert
-ipykernel
-lxml
+# Exact versions used for every result in this repository (Python 3.13.17).
+# On Kaggle the notebook runs with the Kaggle image and prints the versions it uses.
+numpy==2.5.4
+pandas==3.1.0
+scipy==1.18.1
+scikit-learn==1.9.1
+lightgbm==4.7.0
+xgboost==3.4.1
+catboost==1.2.10
+joblib==1.6.0
+# tests, Kaggle notebook builder, Kaggle CLI
+pytest==9.1.1
+nbformat==5.11.1
+kaggle==2.2.5

@@ -1,14 +1,14 @@
-"""Modello ricorsivo "stile RNN" con ML classico.
+"""Recursive, RNN-like roll-out model built with classical ML.
 
-1. Un modello di transizione impara l'esito di un singolo turno:
-   (stato_t, memoria_t) -> (delta HP p1, delta HP p2, P(KO p1), P(KO p2)).
-   La memoria è una media esponenziale dei delta passati (l'analogo dell'hidden state
-   di una RNN). Non usa le etichette, quindi si allena anche sulle timeline di test.
-2. Dal turno 30 il modello viene applicato ricorsivamente alle proprie uscite (con
-   residui campionati) fino a che un team è esausto: si ricostruisce il resto della battaglia.
-3. Le statistiche dei rollout diventano feature per lo stacking.
+1. A transition model learns the outcome of a single turn:
+   (state_t, memory_t) -> (HP delta p1, HP delta p2, P(KO p1), P(KO p2)).
+   The memory is an exponential moving average of past deltas (the analogue of an RNN hidden state).
+   It is trained on the training timelines only (the training fold inside cross-validation).
+2. From the last observed turn the model is applied recursively to its own outputs, with sampled
+   residuals, until a team is exhausted: this reconstructs the rest of the battle.
+3. The statistics of the roll-outs become features for the stacking.
 
-Uso: python src/recursive.py [--n-rollouts 30] [--min-turn 18]  ->  outputs/rec_features.pkl
+Usage: python src/recursive.py [--n-rollouts 30]  ->  outputs/rec_features.pkl
 """
 import argparse
 import os
@@ -22,21 +22,17 @@ from sklearn.metrics import r2_score, roc_auc_score
 
 sys.path.insert(0, os.path.dirname(__file__))
 from compute import configure, describe, n_jobs
-from features import load_jsonl
+from dataset import OUT, SNAP_TURNS, load_battles
 
-ROOT = os.path.join(os.path.dirname(__file__), "..")
-DATA = os.environ.get("POKEMON_DATA", os.path.join(ROOT, "data"))  # su Kaggle: /kaggle/input/...
-OUT = os.environ.get("POKEMON_OUT", os.path.join(ROOT, "outputs"))
 EMA = 0.8
 MAX_TURNS = 200
-SNAP_TURNS = (24, 26, 28)
 STATE = ["hp1", "hp2", "alive1", "alive2", "slp1", "slp2", "par1", "par2", "psn1", "psn2", "spk1", "spk2",
          "ema_dhp1", "ema_dhp2", "ema_f1", "ema_f2"]
 STATIC = ["p1_bst", "p1_spe", "p1_def", "p1_spd"]
 
 
 def battle_sequence(b):
-    """Sequenza degli stati aggregati turno per turno + contesto statico."""
+    """Turn-by-turn sequence of aggregate states, plus static team context."""
     team = b["p1_team_details"]
     static = [np.mean([sum(p["base_" + s] for s in ("hp", "atk", "def", "spa", "spd", "spe")) for p in team]),
               np.mean([p["base_spe"] for p in team]), np.mean([p["base_def"] for p in team]),
@@ -69,7 +65,7 @@ def battle_sequence(b):
 
 
 def add_memory(seq):
-    """Aggiunge la memoria (EMA dei delta di HP e dei KO) a ogni turno."""
+    """Adds the memory (EMA of the HP and KO deltas) to every turn."""
     mem = np.zeros((len(seq), 4))
     h = np.zeros(4)
     for t in range(1, len(seq)):
@@ -81,14 +77,14 @@ def add_memory(seq):
 
 
 def last_state(b):
-    """Stato (con memoria) all'ultimo turno della timeline, punto di partenza dei rollout."""
+    """State (with memory) at the last turn of the timeline: the starting point of the roll-outs."""
     seq, static = battle_sequence(b)
     return np.concatenate([add_memory(seq)[-1], static])
 
 
 def build_transitions(battles, min_turn=1):
-    """Transizioni turno -> turno. Esclude i turni di rimpiazzo dopo un KO (nessuno agisce
-    davvero) e, con min_turn, i primi turni della battaglia."""
+    """Turn -> turn transitions. Skips the replacement turns after a KO (nobody really acts) and,
+    with min_turn, the first turns of the battle."""
     X, Y, last = [], [], []
     for b in battles:
         seq, static = battle_sequence(b)
@@ -98,7 +94,7 @@ def build_transitions(battles, min_turn=1):
             if t + 1 < min_turn:
                 continue
             if t > 0 and (S[t, 2] < S[t - 1, 2] or S[t, 3] < S[t - 1, 3]):
-                continue  # KO nel turno t: t -> t+1 è il turno di rimpiazzo
+                continue  # KO at turn t: t -> t+1 is the replacement turn
             X.append(np.concatenate([S[t], static]))
             Y.append([S[t + 1, 0] - S[t, 0], S[t + 1, 1] - S[t, 1],
                       float(S[t + 1, 2] < S[t, 2]), float(S[t + 1, 3] < S[t, 3])])
@@ -106,8 +102,8 @@ def build_transitions(battles, min_turn=1):
 
 
 def fit_transition(X, Y, n_trees=100):
-    """Quattro modelli: due regressori sui delta HP, due classificatori sui KO."""
-    # learning rate scalato col numero di alberi: meno alberi = rollout più veloci
+    """Four models: two regressors for the HP deltas, two classifiers for the KOs."""
+    # learning rate scaled with the number of trees: fewer trees = faster roll-outs
     params = dict(n_estimators=n_trees, learning_rate=15 / n_trees, num_leaves=31, min_child_samples=100,
                   subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=42, verbose=-1,
                   n_jobs=n_jobs())
@@ -128,7 +124,7 @@ def fit_transition(X, Y, n_trees=100):
 
 
 def rollout(models, residuals, start, n_rollouts, seed=0):
-    """Applica ricorsivamente il modello di transizione da turno 30 fino alla fine."""
+    """Applies the transition model recursively from the last observed turn to the end."""
     rng = np.random.default_rng(seed)
     n_b = len(start)
     S = np.repeat(start, n_rollouts, axis=0)
@@ -151,7 +147,7 @@ def rollout(models, residuals, start, n_rollouts, seed=0):
         new[:, 3] -= f2
         new[:, 0] = np.clip(X[:, 0] + dhp1, 0, new[:, 2])
         new[:, 1] = np.clip(X[:, 1] + dhp2, 0, new[:, 3])
-        # i dormienti si svegliano con probabilità 1/3 a turno; status persi coi KO
+        # sleepers wake up with probability 1/3 per turn; statuses are lost with KOs
         for c in (4, 5):
             new[:, c] = np.maximum(0, new[:, c] - (rng.random(len(act)) < new[:, c] / 3))
         for c, a in ((4, 2), (5, 3), (6, 2), (7, 3), (8, 2), (9, 3)):
@@ -181,21 +177,20 @@ def rollout(models, residuals, start, n_rollouts, seed=0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-rollouts", type=int, default=30)
-    ap.add_argument("--min-turn", type=int, default=1, help="allena solo sulle transizioni dal turno N in poi")
-    ap.add_argument("--trees", type=int, default=100, help="alberi per modello di transizione")
-    ap.add_argument("--n-jobs", type=int, default=0, help="thread (default: tutti i core)")
-    ap.add_argument("--out", default="rec_features.pkl")
+    ap.add_argument("--trees", type=int, default=100, help="trees per transition model")
+    ap.add_argument("--n-jobs", type=int, default=0, help="threads (default: all cores)")
     args = ap.parse_args()
     configure(args.n_jobs)
     print(describe())
     t0 = time.time()
-    train = load_jsonl(os.path.join(DATA, "train.jsonl"))
-    test = load_jsonl(os.path.join(DATA, "test.jsonl"))
+    train, test, _ = load_battles()
     battles = train + test
-    X, Y, last = build_transitions(battles, args.min_turn)
-    print(f"{len(X)} transizioni da {len(battles)} battaglie ({time.time() - t0:.0f}s)")
+    # the transition model is trained on the training battles only; test battles are only rolled out
+    X, Y, _ = build_transitions(train)
+    print(f"{len(X)} transitions from {len(train)} training battles ({time.time() - t0:.0f}s)")
     models, residuals = fit_transition(X, Y, args.trees)
-    # anche gli snapshot dei battle di train, per l'augmentation dello stacking
+    last = np.array([last_state(b) for b in battles])
+    # snapshots of the training battles too, for the augmentation
     snap_turns = [t for t in SNAP_TURNS for _ in train]
     snap_last = np.array([last_state({**b, "battle_timeline": b["battle_timeline"][:t]})
                           for t in SNAP_TURNS for b in train])
@@ -205,11 +200,10 @@ def main():
     df.insert(2, "snap_turn", [30] * len(battles) + snap_turns)
     y = np.array([b["player_won"] for b in train])
     trm = (df.is_test.values == 0) & (df.snap_turn.values == 30)
-    print(f"rollout completati ({time.time() - t0:.0f}s)")
-    print(f"accuracy di rec_win > 0.5 sul train: {((df.rec_win.values[trm] > 0.5) == y).mean():.4f}")
-    print(df[trm].describe().T[["mean", "std"]])
+    print(f"roll-outs done ({time.time() - t0:.0f}s)")
+    print(f"training accuracy of rec_win > 0.5: {((df.rec_win.values[trm] > 0.5) == y).mean():.4f}")
     os.makedirs(OUT, exist_ok=True)
-    df.to_pickle(os.path.join(OUT, args.out))
+    df.to_pickle(os.path.join(OUT, "rec_features.pkl"))
 
 
 if __name__ == "__main__":

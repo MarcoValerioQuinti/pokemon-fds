@@ -1,8 +1,11 @@
-"""Feature engineering per la predizione delle battaglie Pokemon Gen 2 OU.
+"""Feature engineering for Pokémon Gen 2 OU battle outcome prediction.
 
-Ogni battaglia contiene il team completo di p1, il lead di p2 e i primi 30 turni.
-Le feature descrivono lo stato della battaglia al turno 30 (e in alcuni checkpoint
-intermedi), la composizione dei team e lo "stile" di gioco osservato.
+Each battle has player 1's full team, player 2's lead and the first 30 turns. The features describe
+the battle state at the last observed turn (plus intermediate checkpoints), the team composition,
+the observed play style and a damage-based matchup analysis (Gen 2 damage formula).
+
+The context statistics (pokédex, Hidden Power types, co-occurrence, move frequencies) are computed
+from reference battles passed in by the caller: the training set only, never the test set.
 """
 import json
 from collections import Counter, defaultdict
@@ -30,79 +33,49 @@ def load_jsonl(path):
         return [json.loads(line) for line in f]
 
 
-def get_actual_move(prev_t, t, side, last_move):
-    """Mossa realmente eseguita da `side` nel turno t, oppure None.
-
-    Il campo *_move_details riporta l'ultima mossa usata da quel pokemon anche nei turni
-    in cui non agisce (circa il 25% delle mosse nel dataset). Va scartato quando:
-    - il pokemon è appena entrato (switch, phazing, rimpiazzo dopo un KO);
-    - il turno è di rimpiazzo dopo un KO e la mossa ripete quella del turno prima;
-    - il pokemon era e resta addormentato (tranne sleeptalk/snore, rest con recupero
-      di HP, o mossa diversa dall'ultima, cioè chiamata da sleeptalk);
-    - il pokemon era e resta congelato.
-    `last_move` è l'ultima mossa reale nota di quel pokemon.
-    """
-    m = t[side + "_move_details"]
-    if m is None or prev_t is None:
-        return m
-    other = "p2" if side == "p1" else "p1"
-    ps, pp = t[side + "_pokemon_state"], prev_t[side + "_pokemon_state"]
-    if ps["name"] != pp["name"]:
-        return None
-    po, co = prev_t[other + "_pokemon_state"], t[other + "_pokemon_state"]
-    pm = prev_t[side + "_move_details"]
-    if po["hp_pct"] == 0 and co["name"] != po["name"] and pm is not None and pm["name"] == m["name"]:
-        return None
-    if pp["status"] == "slp" and ps["status"] == "slp":
-        if m["name"] in ("sleeptalk", "snore"):
-            return m
-        if m["name"] == "rest" and ps["hp_pct"] > pp["hp_pct"]:
-            return m
-        if m["name"] == last_move:
-            return None
-    if pp["status"] == "frz" and ps["status"] == "frz":
-        return None
-    return m
-
-
-def clean_battles(battles):
-    """Copia delle battaglie con le mosse persistenti (non eseguite) messe a None."""
-    out = []
-    for b in battles:
-        tl = []
-        last = {"p1": {}, "p2": {}}
-        prev = None
-        for t in b["battle_timeline"]:
-            t2 = dict(t)
-            for side in ("p1", "p2"):
-                name = t[side + "_pokemon_state"]["name"]
-                m = get_actual_move(prev, t, side, last[side].get(name))
-                t2[side + "_move_details"] = m
-                if m is not None:
-                    last[side][name] = m["name"]
-            tl.append(t2)
-            prev = t  # confronto con il turno grezzo (serve la mossa riportata, non quella pulita)
-        out.append({**b, "battle_timeline": tl})
-    return out
-
-
 def load_type_chart(path):
     df = pd.read_csv(path)
-    chart = {}  # dict semplice (picklabile per il multiprocessing spawn); assente = 1.0
+    chart = {}  # plain dict (picklable for spawn multiprocessing); a missing pair means x1
     for a, d, m in df.itertuples(index=False):
         chart[(a, d)] = m
     return chart
 
 
+class Pokedex(dict):
+    """species -> base stats and types. A species never seen in the reference battles gets the mean
+    stats and no type (neutral multipliers)."""
+
+    def __missing__(self, name):
+        if not hasattr(self, "_mean"):
+            vals = list(self.values())
+            self._mean = {"types": [], **{s: float(np.mean([v[s] for v in vals])) if vals else 80.0 for s in STATS}}
+        return self._mean
+
+
+def _dex_entry(p):
+    return {"types": [t for t in p["types"] if t != "notype"], **{s: p["base_" + s] for s in STATS}}
+
+
 def build_pokedex(battles):
-    """Base stats e tipi per ogni specie, ricavati dai team p1 e dai lead p2."""
-    dex = {}
+    """Base stats and types of every species in the player 1 teams and player 2 leads of the reference
+    battles (the training set)."""
+    dex = Pokedex()
     for b in battles:
         for p in b["p1_team_details"] + [b["p2_lead_details"]]:
             if p["name"] not in dex:
-                dex[p["name"]] = {"types": [t for t in p["types"] if t != "notype"],
-                                  **{s: p["base_" + s] for s in STATS}}
+                dex[p["name"]] = _dex_entry(p)
     return dex
+
+
+def with_own_details(dex, b):
+    """The reference pokédex plus the species described in the battle itself (player 1 team and
+    player 2 lead): they are inputs of that battle, so no information comes from other battles."""
+    own = {p["name"]: p for p in b["p1_team_details"] + [b["p2_lead_details"]] if p["name"] not in dex}
+    if not own:
+        return dex
+    out = Pokedex(dex)
+    out.update({n: _dex_entry(p) for n, p in own.items()})
+    return out
 
 
 def type_mult(chart, atk_type, def_types):
@@ -113,7 +86,7 @@ def type_mult(chart, atk_type, def_types):
 
 
 class SideState:
-    """Stato noto di un lato del campo: hp e status per ogni pokemon visto."""
+    """Known state of one side: HP and status of every Pokémon seen so far."""
 
     def __init__(self):
         self.hp = {}
@@ -145,7 +118,7 @@ class SideState:
         for s in BAD_STATUS:
             out["n_" + s] = st.get(s, 0)
         out["n_statused"] = sum(st.get(s, 0) for s in BAD_STATUS)
-        # pokemon "utili": vivi e non addormentati/congelati
+        # "useful" Pokémon: alive and neither asleep nor frozen
         out["n_healthy"] = out["alive"] - st.get("slp", 0) - st.get("frz", 0)
         out["eff_hp"] = sum(h * (0.5 if self.status[n] in ("slp", "frz") else 0.8 if self.status[n] in ("par", "tox") else 1.0)
                             for n, h in self.hp.items()) + unseen
@@ -158,7 +131,7 @@ def battle_features(b, dex, chart):
     p1_team = b["p1_team_details"]
     p1_names = [p["name"] for p in p1_team]
 
-    # ---- composizione team p1 (statica) ----
+    # ---- player 1 team composition (static) ----
     for s in STATS:
         vals = [p["base_" + s] for p in p1_team]
         f[f"p1_team_{s}_mean"] = np.mean(vals)
@@ -174,7 +147,7 @@ def battle_features(b, dex, chart):
         f[f"p2_lead_{s}"] = lead2["base_" + s]
     f["lead_spe_diff"] = p1_team[0]["base_spe"] - lead2["base_spe"]
 
-    # ---- simulazione dello stato lungo la timeline ----
+    # ---- replay the timeline to track the state ----
     s1, s2 = SideState(), SideState()
     moves = {"p1": Counter(), "p2": Counter()}
     cats = {"p1": Counter(), "p2": Counter()}
@@ -192,7 +165,7 @@ def battle_features(b, dex, chart):
             if prev[side] is not None and prev[side] != name:
                 switches[side] += 1
             prev[side] = name
-            # danno subito da questo lato -> danno inflitto dall'avversario
+            # damage taken by this side = damage dealt by the opponent
             other = "p2" if side == "p1" else "p1"
             if name in st.hp:
                 delta = st.hp[name] - ps["hp_pct"]
@@ -215,7 +188,7 @@ def battle_features(b, dex, chart):
         a, c = s1.summary(), s2.summary()
         hp_diff_traj.append(a["hp_sum"] - c["hp_sum"])
         faint_diff_traj.append(a["fainted"] - c["fainted"])
-    # checkpoint relativi all'ultimo turno (al turno 30: t25, t20, ... t5)
+    # checkpoints relative to the last turn (at turn 30: t25, t20, ... t5)
     for k in CHECKPOINTS:
         i = max(-1 - k, -len(hp_diff_traj))
         f[f"hp_diff_t{30 - k}"] = hp_diff_traj[i]
@@ -233,10 +206,10 @@ def battle_features(b, dex, chart):
     f["hp_diff_max"] = max(hp_diff_traj)
     f["hp_diff_mean"] = np.mean(hp_diff_traj)
 
-    # p1 ha HP/status anche per i pokemon non ancora entrati (pieni)
+    # player 1 Pokémon that have not entered yet are known and at full HP
     p1_unseen = [n for n in p1_names if n not in s1.hp]
     f["p1_n_unseen"] = len(p1_unseen)
-    # stats dei pokemon vivi
+    # stats of the alive Pokémon
     for side, st, extra in (("p1", s1, p1_unseen), ("p2", s2, [])):
         alive = [n for n, h in st.hp.items() if h > 0] + extra
         alive = [n for n in alive if n in dex]
@@ -247,7 +220,7 @@ def battle_features(b, dex, chart):
     for s in ["atk", "spa", "spe"]:
         f[f"diff_alive_{s}_sum"] = f[f"p1_alive_{s}_sum"] - f[f"p2_alive_{s}_sum"]
 
-    # ---- stato attivo al turno 30 ----
+    # ---- active Pokémon at the last turn ----
     last = tl[-1]
     act = {}
     for side in ("p1", "p2"):
@@ -267,7 +240,7 @@ def battle_features(b, dex, chart):
         f[f"diff_active_boost_{bst}"] = f[f"p1_active_boost_{bst}"] - f[f"p2_active_boost_{bst}"]
     f["active_spe_diff"] = f["p1_active_spe"] - f["p2_active_spe"]
     f["p1_active_status"] = f["p1_active_status"]
-    # efficacia di tipo tra gli attivi (STAB)
+    # type effectiveness between the actives (STAB)
     d1, d2 = dex.get(act["p1"]), dex.get(act["p2"])
     if d1 and d2:
         f["p1_vs_p2_type"] = max(type_mult(chart, t, d2["types"]) for t in d1["types"])
@@ -275,7 +248,7 @@ def battle_features(b, dex, chart):
     else:
         f["p1_vs_p2_type"] = f["p2_vs_p1_type"] = np.nan
 
-    # ---- matchup team: tipi STAB di p1 vivi contro p2 vivi (e viceversa) ----
+    # ---- team matchup: STAB types of the alive Pokémon against the other side ----
     p1_alive = [n for n in p1_names if s1.hp.get(n, 1.0) > 0 and n in dex]
     p2_alive = [n for n, h in s2.hp.items() if h > 0 and n in dex]
     def best_cover(att, dfn):
@@ -285,7 +258,7 @@ def battle_features(b, dex, chart):
     f["p1_cover_p2"] = best_cover(p1_alive, p2_alive)
     f["p2_cover_p1"] = best_cover(p2_alive, p1_alive)
 
-    # ---- stile di gioco / mosse ----
+    # ---- play style / moves ----
     for side in ("p1", "p2"):
         mv = moves[side]
         f[f"{side}_switches"] = switches[side]
@@ -307,12 +280,12 @@ def battle_features(b, dex, chart):
         f[f"{side}_n_unique_moves"] = len(mv)
     f["diff_dmg_dealt"] = f["p1_dmg_dealt"] - f["p2_dmg_dealt"]
     f["diff_switches"] = f["p1_switches"] - f["p2_switches"]
-    # spikes attive: piazzate e non rimosse dopo l'ultimo rapid spin (approssimazione)
+    # Spikes still up: laid and not removed by Rapid Spin (approximation)
     f["spikes_on_p2"] = int(moves["p1"]["spikes"] > 0 and moves["p2"]["rapidspin"] == 0)
     f["spikes_on_p1"] = int(moves["p2"]["spikes"] > 0 and moves["p1"]["rapidspin"] == 0)
     f["diff_spikes"] = f["spikes_on_p2"] - f["spikes_on_p1"]
 
-    # bag-of-pokemon (testo, vettorizzato dopo)
+    # bag-of-Pokémon / bag-of-moves as text, vectorized later (dataset.add_bags)
     f["_p1_team"] = " ".join(p1_names)
     f["_p1_alive"] = " ".join(p1_alive)
     f["_p2_seen"] = " ".join(s2.hp.keys())
@@ -324,11 +297,11 @@ def battle_features(b, dex, chart):
 
 SPECIAL_TYPES = {"fire", "water", "electric", "grass", "ice", "psychic", "dragon", "dark"}
 FIXED_POWER = {"hiddenpower": 70, "return": 102, "frustration": 102, "present": 40, "magnitude": 70, "reversal": 60}
-FIXED_DAMAGE = {"seismictoss", "nightshade"}  # danno = livello (100 HP)
+FIXED_DAMAGE = {"seismictoss", "nightshade"}  # damage = user level
 
 
 def calc_stat(base, level, hp=False):
-    """Stat Gen 2 con DV e stat exp massimi."""
+    """Gen 2 stat with maximum DVs and stat experience."""
     core = ((base + 15) * 2 + 63) * level // 100
     return core + level + 10 if hp else core + 5
 
@@ -338,13 +311,13 @@ HP_TYPES = ["fighting", "flying", "poison", "ground", "rock", "bug", "ghost", "s
 
 
 def infer_hp_types(battles, dex, chart, min_obs=5):
-    """Tipo di hiddenpower per specie, stimato dai danni osservati.
+    """Hidden Power type of each species, inferred from the observed damage.
 
-    Per ogni uso di hiddenpower in cui il difensore resta in campo, il rapporto tra
-    danno osservato e danno neutro previsto stima il moltiplicatore di tipo; si sceglie
-    il tipo che spiega meglio tutte le osservazioni della specie.
+    For every Hidden Power hit where the defender stays in, the ratio between the observed and the
+    neutral predicted damage estimates the type multiplier; the type that best explains all the
+    observations of the species is chosen.
     """
-    obs = defaultdict(list)  # specie -> [(danno osservato, difensore)]
+    obs = defaultdict(list)  # species -> [(observed damage, defender)]
     hp_move = {"name": "hiddenpower", "type": "normal", "category": "special", "base_power": 70, "accuracy": 1.0}
     for b in battles:
         tl = b["battle_timeline"]
@@ -373,10 +346,10 @@ def infer_hp_types(battles, dex, chart, min_obs=5):
 
 
 def build_cooccurrence(battles):
-    """P(b nel team | a nel team) stimata dai team completi di p1."""
+    """P(b in the team | a in the team), estimated from the full player 1 teams."""
     pair, single = Counter(), Counter()
     for b in battles:
-        names = sorted({p["name"] for p in b["p1_team_details"]})  # ordine deterministico
+        names = sorted({p["name"] for p in b["p1_team_details"]})  # deterministic order
         for a in names:
             single[a] += 1
             for c in names:
@@ -389,7 +362,7 @@ def build_cooccurrence(battles):
 
 
 def damage_frac(dex, chart, att, dfn, move, att_level=100, dfn_level=100, item=None, hp_type=None):
-    """Danno atteso di `move` di att su dfn, come frazione degli HP massimi di dfn."""
+    """Expected damage of `move` from att to dfn, as a fraction of dfn's maximum HP."""
     a, d = dex[att], dex[dfn]
     max_hp = calc_stat(d["hp"], dfn_level, hp=True)
     name, mtype = move["name"], move["type"]
@@ -413,22 +386,21 @@ def damage_frac(dex, chart, att, dfn, move, att_level=100, dfn_level=100, item=N
     dmg = ((2 * att_level / 5 + 2) * bp * A / D / 50 + 2)
     stab = 1.5 if mtype in a["types"] else 1.0
     mult = 1.0 if hp_unknown else type_mult(chart, mtype, d["types"])
-    return dmg * stab * mult * move["accuracy"] * 0.925 / max_hp  # 0.925 = media del random roll
+    return dmg * stab * mult * move["accuracy"] * 0.925 / max_hp  # 0.925 = mean random roll
 
 
 def stab_moves(dex, name):
-    """Mosse STAB generiche per pokemon di cui non conosciamo il set."""
+    """Generic STAB moves for a Pokémon whose moveset is unknown."""
     d = dex[name]
     return [{"name": "stab", "type": t, "category": "special" if t in SPECIAL_TYPES else "physical",
              "base_power": 80, "accuracy": 1.0} for t in d["types"]]
 
 
 def build_species_moves(battles):
-    """Statistiche delle mosse (reali) per specie, su tutte le battaglie.
+    """Move statistics per species over the reference battles.
 
-    Restituisce (top_damaging, freq): le 2 mosse offensive più usate dalla specie, usate
-    come fallback quando un pokemon non ha rivelato mosse d'attacco, e la frazione di
-    battaglie in cui la specie ha usato ciascuna mossa.
+    Returns (top_damaging, freq): the 2 most used attacking moves of the species, the fallback when a
+    Pokémon has not revealed any attack, and the fraction of battles in which the species used each move.
     """
     used = defaultdict(Counter)
     appear = Counter()
@@ -438,7 +410,7 @@ def build_species_moves(battles):
         for t in b["battle_timeline"]:
             for side in ("p1", "p2"):
                 name = t[side + "_pokemon_state"]["name"]
-                seen[name]  # registra la presenza
+                seen[name]  # record the appearance
                 m = t[side + "_move_details"]
                 if m:
                     seen[name].add(m["name"])
@@ -449,8 +421,8 @@ def build_species_moves(battles):
     freq = {sp: {m: c / appear[sp] for m, c in cnt.items()} for sp, cnt in used.items()}
     top = {}
     for sp, cnt in used.items():
-        # ordinamento deterministico (conteggio, poi nome): most_common rompe i pareggi
-        # nell'ordine di inserimento, che dipende dall'hash randomizzato dei set
+        # deterministic order (count, then name): most_common breaks ties by insertion order,
+        # which depends on the randomized hashing of sets
         dmg = [m for m, _ in sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))
                if details[m]["category"] != "status" or m in FIXED_DAMAGE]
         top[sp] = [details[m] for m in dmg[:2]]
@@ -461,12 +433,12 @@ def boost_mult(stage):
     return (2 + stage) / 2 if stage >= 0 else 2 / (2 - stage)
 
 
-CLERICS = {"blissey", "miltank", "chansey"}
+CLERIC_MOVES = {"healbell", "aromatherapy"}
 WINCON_SETUP = {"curse", "bellydrum", "swordsdance", "growth"}
 
 
 def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq):
-    """Matrice di danno tra pokemon vivi dei due lati usando le mosse rivelate."""
+    """Damage matrix between the alive Pokémon of the two sides, using the revealed moves."""
     tl = b["battle_timeline"]
     p1_items = {p["name"]: p["item"] for p in b["p1_team_details"]}
     p1_level = {p["name"]: p["level"] for p in b["p1_team_details"]}
@@ -483,11 +455,11 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
                 known[side][ps["name"]][m["name"]] = m
 
     def best_move(side, att, dfn):
-        """(danno frazionale atteso, mossa speciale?) della mossa migliore di att su dfn."""
+        """(expected damage fraction, is special) of att's best move against dfn."""
         mv = list(known[side][att].values())
         dmg_moves = [m for m in mv if m["category"] != "status" or m["name"] in FIXED_DAMAGE]
         if not dmg_moves:
-            # nessuna mossa d'attacco rivelata: le più usate dalla specie, altrimenti STAB generico
+            # no attack revealed: the species' most used attacks, otherwise a generic STAB move
             dmg_moves = species_moves.get(att) or stab_moves(dex, att)
         lv_a = p1_level.get(att, 100) if side == "p1" else 100
         lv_d = 100 if side == "p1" else p1_level.get(dfn, 100)
@@ -505,7 +477,7 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
     def best_dmg(side, att, dfn):
         return best_move(side, att, dfn)[0]
 
-    # distribuzione dei pokemon di p2 non ancora visti (co-occorrenze nei team p1)
+    # distribution of player 2's unseen Pokémon (co-occurrence in the player 1 teams)
     seen2 = [n for n in hp["p2"] if n in dex]
     n_unseen = max(6 - len(hp["p2"]), 0)
     probs = Counter()
@@ -524,7 +496,7 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
             for k in ["best_dmg_mean", "ohko_frac", "2hko_frac", "fast_ohko_frac", "checked_frac", "threat_max"]:
                 f[f"{side}_{k}"] = 0.0
             continue
-        M = np.array([[best_dmg(side, a, d) for d in D] for a in A])  # danno frazionale su HP max
+        M = np.array([[best_dmg(side, a, d) for d in D] for a in A])  # damage as a fraction of max HP
         rem = np.array([hp[other][d] for d in D])
         spe_a = np.array([dex[a]["spe"] for a in A])[:, None]
         spe_d = np.array([dex[d]["spe"] for d in D])[None, :]
@@ -535,13 +507,13 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
         f[f"{side}_ohko_frac"] = (best >= rem).mean()
         f[f"{side}_2hko_frac"] = (best * 2 >= rem).mean()
         f[f"{side}_fast_ohko_frac"] = ((M >= rem[None, :]) & faster).any(axis=0).mean()
-        # quanti avversari vengono "controllati": qualcuno li colpisce per >=40%
+        # opponents that are "checked": someone hits them for at least 40%
         f[f"{side}_checked_frac"] = (best >= 0.4).mean()
         f[f"{side}_threat_max"] = M.max()
         htk = np.ceil(rem / np.maximum(best, 0.05))
         n_targets = len(D)
         if side == "p1" and n_unseen and probs:
-            # slot virtuali per i pokemon di p2 non visti (pieni), pesati con le co-occorrenze
+            # virtual slots for player 2's unseen Pokémon (full HP), weighted by co-occurrence
             exp_htk = sum(p * np.ceil(1 / max(max(best_dmg("p1", a, c) for a in A), 0.05)) for c, p in probs.items())
             htk = np.append(htk, [exp_htk] * n_unseen)
             n_targets += n_unseen
@@ -551,7 +523,7 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
               "hits_to_kill", "hits_to_kill_per_mon"]:
         f[f"diff_{k}"] = f.get(f"p1_{k}", 0) - f.get(f"p2_{k}", 0)
 
-    # duello attuale degli attivi al turno 30, con boost e paralisi
+    # current duel between the actives, with boosts and paralysis
     last = tl[-1]
     a1, a2 = last["p1_pokemon_state"]["name"], last["p2_pokemon_state"]["name"]
     if a1 in dex and a2 in dex and hp["p1"][a1] > 0 and hp["p2"][a2] > 0:
@@ -562,7 +534,7 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
             return d * boost_mult(ba[off]) / boost_mult(bd[dfs])
         d12, d21 = boosted("p1", a1, a2, b1, b2), boosted("p2", a2, a1, b2, b1)
         if "substitute" in last["p2_pokemon_state"]["effects"]:
-            d12 *= 0.75  # il primo colpo va sul substitute
+            d12 *= 0.75  # the first hit goes to the Substitute
         if "substitute" in last["p1_pokemon_state"]["effects"]:
             d21 *= 0.75
         f["active_p1_dmg"] = d12
@@ -578,8 +550,8 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
                   "active_p1_faster"]:
             f[k] = np.nan
 
-    # ---- spikes cronologici (rapid spin fallisce contro ghost) ----
-    spikes = {"p1": False, "p2": False}  # spikes sul lato di ...
+    # ---- Spikes in chronological order (Rapid Spin fails against Ghost types) ----
+    spikes = {"p1": False, "p2": False}  # Spikes on the field of ...
     for t in tl:
         for side, other in (("p1", "p2"), ("p2", "p1")):
             m = t[side + "_move_details"]
@@ -597,8 +569,8 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
     f["p1_has_spinner_alive"] = int(any("rapidspin" in known["p1"][n] for n in alive["p1"]))
     f["p2_has_spinner_alive"] = int(any("rapidspin" in known["p2"][n] for n in alive["p2"]))
 
-    # ---- sonno: da rest (temporaneo) o indotto; turni di sonno "consumati" al turno 30 ----
-    # Il contatore del sonno in Gen 2 scende solo quando il pokemon è in campo e prova ad agire.
+    # ---- sleep: from Rest (short) or induced; sleep turns already used at the last turn ----
+    # In Gen 2 the sleep counter only goes down while the Pokémon is in and tries to act.
     for side in ("p1", "p2"):
         rest_sleep, induced_sleep, induced_burned, rest_waking = 0, 0, 0, 0
         last_rest, burned = {}, {}
@@ -613,19 +585,19 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
                     last_rest[name] = t["turn"]
                     burned[name] = 0
                 else:
-                    berry += 1  # rest seguito da risveglio immediato: mintberry / miracleberry
+                    berry += 1  # Rest followed by an immediate wake-up: Mint Berry / Miracle Berry
             elif ps["status"] == "slp":
                 if prev is not None and prev["name"] == name and prev["status"] == "slp":
                     burned[name] = burned.get(name, 0) + 1
                 else:
                     burned.setdefault(name, 0)
             else:
-                # sveglio: dimentica rest e contatore
+                # awake: forget Rest and the counter
                 last_rest.pop(name, None)
                 burned.pop(name, None)
             if (prev is not None and prev["name"] == name and prev["status"] in ("par", "psn", "tox", "brn", "frz")
                     and ps["status"] == "nostatus" and ps["hp_pct"] > 0 and not (m and m["name"] == "rest")):
-                berry += 1  # status curato senza rest: miracleberry / przcureberry ecc.
+                berry += 1  # status cured without Rest: Miracle Berry, PRZ Cure Berry, ...
             prev = ps
         for n, st in status[side].items():
             if st == "slp" and hp[side].get(n, 0) > 0:
@@ -640,11 +612,11 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
         f[f"{side}_induced_sleep"] = induced_sleep
         f[f"{side}_induced_sleep_turns"] = induced_burned
         f[f"{side}_berry_used"] = berry
-        # mosse note per pokemon vivi (quanto del set è stato rivelato)
+        # known moves of the alive Pokémon (how much of the movesets was revealed)
         f[f"{side}_known_moves_alive"] = sum(len(known[side][n]) for n in alive[side])
     f["diff_induced_sleep"] = f["p1_induced_sleep"] - f["p2_induced_sleep"]
 
-    # ---- win condition di fine partita: setup non phazabile, cleric ----
+    # ---- late-game win conditions: setup that cannot be phazed, clerics ----
     def has_move(side, n, moves, min_freq=0.3):
         if any(m in known[side][n] for m in moves):
             return True
@@ -655,20 +627,20 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
         f[f"{side}_setup_alive"] = int(setup)
         f[f"{side}_phazer_alive"] = int(phazer)
         f[f"{side}_unphazed_setup"] = int(setup and not phazer)
-        cleric = any(n in CLERICS or "healbell" in known[side][n] for n in alive[side])
+        cleric = any(has_move(side, n, CLERIC_MOVES) for n in alive[side])  # learned from the data, not a list
         f[f"{side}_cleric_alive"] = int(cleric)
         n_st = sum(1 for n in alive[side] if status[side].get(n) in ("par", "psn", "tox", "brn", "slp", "frz"))
         f[f"{side}_status_burden"] = n_st * (0.3 if cleric else 1.0)
     f["unphazed_setup_adv"] = f["p1_unphazed_setup"] - f["p2_unphazed_setup"]
     f["diff_status_burden"] = f["p1_status_burden"] - f["p2_status_burden"]
 
-    # ---- pokemon di p2 non ancora visti, stimati dalle co-occorrenze nei team p1 ----
+    # ---- player 2's unseen Pokémon, estimated from co-occurrence in the player 1 teams ----
     f["p2_n_unseen"] = n_unseen
     if n_unseen and probs:
         for s in STATS:
             f[f"p2_unseen_exp_{s}"] = sum(p * dex[c][s] for c, p in probs.items())
         f["p2_unseen_exp_bst"] = sum(f[f"p2_unseen_exp_{s}"] for s in STATS)
-        # quanto i vivi di p1 colpiscono (STAB) e sono colpiti dai probabili non visti
+        # how hard the alive player 1 Pokémon hit (STAB), and are hit by, the likely unseen ones
         f["p1_cover_p2_unseen"] = sum(
             p * max((type_mult(chart, t, dex[c]["types"]) for a in alive["p1"] for t in dex[a]["types"]), default=1.0)
             for c, p in probs.items())
@@ -685,14 +657,14 @@ def matchup_features(b, dex, chart, hp_types, cooc, species_moves, species_freq)
 
 
 def build_context(battles, dex, chart):
-    """Statistiche globali (senza etichette) calcolate sulle battaglie già pulite."""
+    """Label-free context statistics learned from the reference battles."""
     species_moves, species_freq = build_species_moves(battles)
     return dict(hp_types=infer_hp_types(battles, dex, chart), cooc=build_cooccurrence(battles)[0],
                 species_moves=species_moves, species_freq=species_freq)
 
 
 def symmetrize_unseen(f):
-    """Aggiunge a p2 il valore atteso dei pokemon non visti, come già avviene per p1."""
+    """Adds the expected value of player 2's unseen Pokémon, as player 1's are already counted."""
     n = f["p2_n_unseen"]
     for s in ["atk", "spa", "spe", "def", "spd", "hp"]:
         f[f"p2_alive_{s}_sum"] += n * f[f"p2_unseen_exp_{s}"]
@@ -704,14 +676,12 @@ def symmetrize_unseen(f):
 
 
 def build_frame(battles, dex, chart, ctx=None, truncate=None):
-    """Feature per battaglia. Le battaglie devono essere già passate da `clean_battles`.
-
-    `truncate=t` calcola le feature come se la timeline finisse al turno t (augmentation).
-    """
+    """One feature row per battle. `truncate=t` computes the features as if the timeline ended at
+    turn t (snapshot augmentation)."""
     ctx = ctx or build_context(battles, dex, chart)
     if truncate:
         battles = [{**b, "battle_timeline": b["battle_timeline"][:truncate]} for b in battles]
-    # le battaglie sono indipendenti: calcolo parallelo (portabile, vedi compute.py)
+    # battles are independent: computed in parallel (portable, see compute.py)
     return pd.DataFrame(pool_map(_frame_row, battles, _init_frame_worker, (dex, chart, ctx), chunksize=200))
 
 
@@ -723,5 +693,5 @@ def _init_frame_worker(dex, chart, ctx):
 
 
 def _frame_row(b):
-    dex, chart = _W["dex"], _W["chart"]
+    dex, chart = with_own_details(_W["dex"], b), _W["chart"]
     return symmetrize_unseen({**battle_features(b, dex, chart), **matchup_features(b, dex, chart, **_W["ctx"])})

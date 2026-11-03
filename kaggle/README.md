@@ -1,93 +1,67 @@
-# Submitting through a Kaggle notebook
+# Kaggle notebook
 
-`pokemon-fds-final.ipynb` is a self-contained Kaggle notebook. It embeds the source of the modules
-it needs, trains the final model on the competition data and writes `/kaggle/working/submission.csv`.
+`pokemon-fds-final.ipynb` is the notebook submitted for the competition:
+- it clones this repository at a fixed commit (no project code is pasted into the notebook);
+- it runs the pipeline on the competition data;
+- it writes the 3 selected final submissions to `/kaggle/working`, each preceded by a markdown
+  cell that explains the approach.
 
 | File | Purpose |
 |---|---|
-| `build_kaggle_notebook.py` | Regenerates the notebook from `src/` and writes `kernel-metadata.json` |
+| `build_kaggle_notebook.py` | Generates the notebook and `kernel-metadata.json` |
 | `pokemon-fds-final.ipynb` | The notebook (built, not executed) |
-| `kernel-metadata.json` | Notebook settings for the Kaggle CLI: owner, title, competition data, no GPU, no internet |
+| `kernel-metadata.json` | Settings for the Kaggle CLI: owner, title, competition data, CPU, internet on (to clone) |
 
-Rebuild the notebook every time `src/` changes:
+The notebook pins a commit, so rebuild it after pushing any change to `src/`:
 
 ```bash
-python kaggle/build_kaggle_notebook.py --user <kaggle-username>
+git push
+python kaggle/build_kaggle_notebook.py --user <kaggle-username>   # pins the current HEAD
 ```
 
-Expected runtime on Kaggle's CPU (4 cores): about 30–40 minutes.
+The output files are:
+- `submission_1_stack10.csv`
+- `submission_2_stack22.csv`
+- `submission_3_stack10_mean.csv`
 
-## Option 1: Kaggle website only
+The run takes about 1 hour on Kaggle's CPU (4 cores).
 
-1. Open the competition, then **Code** → **New Notebook**.
-2. **File** → **Import Notebook**, and choose `kaggle/pokemon-fds-final.ipynb`.
-3. In the right panel:
-   - **Input:** the competition data must be attached (add it with **Add Input** if missing);
+## From the Kaggle website
+
+1. Open the competition, then **Code** → **New Notebook** → **File** → **Import Notebook**, and
+   choose `kaggle/pokemon-fds-final.ipynb`.
+2. In the right panel:
+   - **Input:** the competition data must be attached;
    - **Accelerator:** None;
-   - **Internet:** off.
-4. **Save Version** → **Save & Run All (Commit)**.
-5. When the run finishes, open the notebook viewer and, under **Output**, click **Submit to
-   Competition**.
+   - **Internet:** on.
+3. **Save Version** → **Save & Run All (Commit)**.
+4. When the run finishes, open the notebook viewer and, under **Output**, submit each of the three
+   CSV files with **Submit to Competition**.
+5. Before the deadline, select the three submissions on the competition's **Submissions** page.
 
-## Option 2: Kaggle CLI
+After the competition ends, make the notebook public.
 
-### One-time setup
+## From the Kaggle CLI
+
+One-time setup:
 
 ```bash
 pip install kaggle            # CLI >= 2.0
-kaggle auth login             # opens the browser and links the CLI to your Kaggle account
+kaggle auth login             # links the CLI to your Kaggle account in the browser
 ```
 
-Instead of `auth login` you can use a legacy API token:
-1. Go to kaggle.com → **Settings** → **API** → **Create New Token**. This downloads `kaggle.json`.
-2. Move it to `~/.kaggle/kaggle.json`.
-3. Run `chmod 600 ~/.kaggle/kaggle.json`.
-
-Then join the competition **on the website** (open its page and accept the rules), otherwise every
-command returns 403. Check that it works:
+Then accept the competition rules on the website (otherwise every command returns 403).
 
 ```bash
-kaggle competitions files fds-pokemon-battles-prediction-2026
-```
-
-### Run the notebook on Kaggle and submit it
-
-```bash
-# 1. set your Kaggle username as the notebook owner (once)
-python kaggle/build_kaggle_notebook.py --user <kaggle-username>
-
-# 2. upload the notebook and run it on Kaggle (creates version 1, then 2, 3, ... on every push)
-kaggle kernels push -p kaggle
-
-# 3. follow the run until the status is "complete" (about 30-40 minutes)
-kaggle kernels status <kaggle-username>/pokemon-fds-final
-
-# 4. optional: download the outputs (submission.csv and the run log)
-kaggle kernels output <kaggle-username>/pokemon-fds-final -p kaggle/output
-
-# 5. submit the notebook's submission.csv (use the version number of the run from step 2)
+kaggle kernels push -p kaggle                              # uploads and RUNS the notebook (new version)
+kaggle kernels status <user>/pokemon-fds-final             # wait for "complete"
+kaggle kernels output <user>/pokemon-fds-final -p kaggle/output
 kaggle competitions submit fds-pokemon-battles-prediction-2026 \
-    -k <kaggle-username>/pokemon-fds-final -v 1 -f submission.csv \
-    -m "final 10-model stack" --wait
-
-# 6. score and history of your submissions
+    -k <user>/pokemon-fds-final -v <version> -f submission_1_stack10.csv -m "stack10"
 kaggle competitions submissions fds-pokemon-battles-prediction-2026
 ```
 
-If the competition also accepts uploaded files, you can skip the notebook and submit the file
-produced locally by `src/final_model.py`:
+The competition allows 3 submissions per day.
 
-```bash
-kaggle competitions submit fds-pokemon-battles-prediction-2026 \
-    -f outputs/submission_final.csv -m "final 10-model stack (local run)"
-```
-
-### Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `403 Forbidden` | Accept the competition rules on the website with the same account |
-| `401 Unauthorized` | Run `kaggle auth login --force` again, or check `~/.kaggle/kaggle.json` |
-| `kernels push` fails on the title | The title must match the slug (`Pokemon FDS Final` → `pokemon-fds-final`); do not edit one without the other |
-| The run stops with "data not found" | The competition data is not attached: check `competition_sources` in `kernel-metadata.json` |
-| Run status `error` | `kaggle kernels output ... -p kaggle/output` downloads the log; the failing step is printed there |
+The CLI cannot cancel a running notebook: cancel it from the website. `kaggle kernels delete`
+removes the whole notebook.
